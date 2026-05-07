@@ -52,6 +52,7 @@ const (
 	WM_MOVE        = 0x0003
 	WM_MOUSEMOVE   = 0x0200
 	WM_LBUTTONUP   = 0x0202
+	WM_MOUSEWHEEL  = 0x020A
 
 	VK_ESCAPE = 0x1B
 
@@ -65,10 +66,20 @@ const (
 	CLOSE_Y    int32 = 14
 	CLOSE_SIZE int32 = 20
 
+	// Hand Cursoe
+	IDC_HAND = 32649
+
 	// Stop/resume button (left of close)
 	STOP_X    int32 = WIN_W - 64
 	STOP_Y    int32 = 14
 	STOP_SIZE int32 = 20
+
+	// Transparency slider (left of stop button)
+	SLIDER_X       int32 = 190
+	SLIDER_Y       int32 = 18
+	SLIDER_W       int32 = STOP_X - SLIDER_X - 12
+	SLIDER_H       int32 = 14
+	SLIDER_THUMB_W int32 = 10
 
 	// Power/start button (centre of window)
 	POWER_BTN_X int32 = WIN_W/2 - 50
@@ -466,6 +477,9 @@ var (
 	procCoCreateInstance          = ole32.NewProc("CoCreateInstance")
 	procCoTaskMemFree             = ole32.NewProc("CoTaskMemFree")
 
+	procSetCursor   = user32.NewProc("SetCursor")
+	procLoadCursorW = user32.NewProc("LoadCursorW")
+
 	HWND_TOPMOST   = ^uintptr(0)
 	SWP_SHOWWINDOW = uintptr(0x0040)
 	SWP_NOMOVE     = uintptr(0x0002)
@@ -486,15 +500,17 @@ func rgba(r, g, b uint8, a float32) D2D1_COLOR_F {
 func rectF(l, t, r, b float32) D2D1_RECT_F { return D2D1_RECT_F{l, t, r, b} }
 
 var (
-	clrBg          = rgba(0x0D, 0x0D, 0x18, 1.0)
-	clrGreen       = rgba(0x34, 0xd3, 0x99, 1)
-	clrGreenDim    = rgba(0x10, 0x99, 0x66, 1)
-	clrGreenMuted  = rgba(0x0a, 0x5c, 0x40, 1)
-	clrTextMain    = rgba(0xf0, 0xf4, 0xff, 1)
-	clrTextDim     = rgba(0x9a, 0xa2, 0xb8, 1)
-	clrRed         = rgba(0xf8, 0x71, 0x71, 1)
-	clrTransparent = rgba(0, 0, 0, 0)
-	clrBtnBg       = rgba(0x23, 0x8b, 0x5a, 1) // dark green for power button
+	clrBg         = rgba(0x0D, 0x0D, 0x18, 1.0)
+	clrGreen      = rgba(0x34, 0xd3, 0x99, 1)
+	clrGreenDim   = rgba(0x10, 0x99, 0x66, 1)
+	clrGreenMuted = rgba(0x0a, 0x5c, 0x40, 1)
+	clrTextMain   = rgba(0xf0, 0xf4, 0xff, 1)
+	clrTextDim    = rgba(0x9a, 0xa2, 0xb8, 1)
+	clrRed        = rgba(0xf8, 0x71, 0x71, 1)
+	clrBtnBg      = rgba(0x23, 0x8b, 0x5a, 1) // dark green for power button
+	clrRedBright  = rgba(0xff, 0x4d, 0x4d, 1)
+	clrUserBubble = rgba(0x1a, 0x2d, 0x42, 0.9) // dark blue
+	clrAiBubble   = rgba(0x12, 0x2e, 0x25, 0.9) // dark green
 )
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -508,6 +524,9 @@ var (
 
 	brushBg, brushGreen, brushGreenDim, brushGreenMuted uintptr
 	brushTextMain, brushTextDim, brushRed, brushBtnBg   uintptr
+	brushRedBright                                      uintptr
+	brushUserBubble                                     uintptr
+	brushAiBubble                                       uintptr
 
 	fmtTitle, fmtSub, fmtBody, fmtBadge, fmtSmall uintptr
 
@@ -516,6 +535,7 @@ var (
 	windowY    int32
 	closeHover bool
 	stopHover  bool
+	fmtClose   uintptr
 )
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -574,6 +594,12 @@ var (
 	scrollDragging  bool
 	dragStartY      int32
 	dragStartOffset float32
+	alphaValue      uint8 = 215 // current transparency (215 = slightly transparent)
+	dragSlider      bool
+	sliderThumbPos  int32 // not used, but keep if needed
+
+	pendingSendCancel    context.CancelFunc
+	pendingSendCancelMux sync.Mutex
 )
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -682,6 +708,20 @@ func inChatArea(x, y int32) bool {
 	return y >= 60 && y <= WIN_H-60
 }
 
+func inSliderArea(x, y int32) bool {
+	return x >= SLIDER_X && x <= SLIDER_X+SLIDER_W && y >= SLIDER_Y && y <= SLIDER_Y+SLIDER_H
+}
+
+func updateAlphaFromMouse(mx int32) {
+	thumbRange := float32(SLIDER_W - SLIDER_THUMB_W)
+	newAlpha := uint8((float32(mx-SLIDER_X) / thumbRange) * 255)
+	if newAlpha < 50 {
+		newAlpha = 50 // minimum opacity
+	}
+	alphaValue = newAlpha
+	procSetLayeredWindowAttributes.Call(uintptr(hwndMain), 0, uintptr(alphaValue), LWA_ALPHA)
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Direct2D Initialization
 // ═══════════════════════════════════════════════════════════════════════════
@@ -732,12 +772,16 @@ func initD2D(hwnd uintptr) error {
 	brushTextDim = createBrush(pRenderTarget, clrTextDim)
 	brushRed = createBrush(pRenderTarget, clrRed)
 	brushBtnBg = createBrush(pRenderTarget, clrBtnBg)
+	brushRedBright = createBrush(pRenderTarget, clrRedBright)
+	brushUserBubble = createBrush(pRenderTarget, clrUserBubble)
+	brushAiBubble = createBrush(pRenderTarget, clrAiBubble)
 
 	fmtTitle = createTextFormat("Segoe UI Variable", DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 17)
 	fmtSub = createTextFormat("Segoe UI Variable", DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 12)
 	fmtBody = createTextFormat("Segoe UI Variable", DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 13)
 	fmtBadge = createTextFormat("Segoe UI Variable", DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 10)
 	fmtSmall = createTextFormat("Segoe UI Variable", DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 10)
+	fmtClose = createTextFormat("Segoe UI Variable", DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 22)
 
 	return nil
 }
@@ -753,13 +797,13 @@ func renderFrame() {
 	W := float32(WIN_W)
 
 	comCall(pRenderTarget, 48)                                  // BeginDraw
-	comCall(pRenderTarget, 47, uintptr(unsafe.Pointer(&clrBg))) // Clear (black → transparent)
+	comCall(pRenderTarget, 47, uintptr(unsafe.Pointer(&clrBg))) // Clear
 
 	sessionMutex.Lock()
 	active := sessionActive
 	sessionMutex.Unlock()
 
-	// ── Header ──────────────────────────────────────────────────────────────
+	// ── Header ──────────────────────────────────────────────────────────
 	d2dText(pRenderTarget, "Candy", fmtTitle, brushGreen, rectF(18, 12, 70, 42))
 	d2dText(pRenderTarget, " Ai", fmtTitle, brushGreenDim, rectF(74, 12, 160, 42))
 
@@ -773,7 +817,7 @@ func renderFrame() {
 	}
 	d2dFillEllipse(pRenderTarget, dotBrush, 110, 27, 4, 4)
 
-	// Stop / resume button (top right)
+	// Stop / resume button (RED when active)
 	var stopIcon string
 	if active {
 		stopIcon = "■"
@@ -782,8 +826,9 @@ func renderFrame() {
 	}
 	stopBr := brushGreenDim
 	if active {
+		stopBr = brushRed
 		if stopHover {
-			stopBr = brushGreen
+			stopBr = brushRedBright
 		}
 	} else {
 		if stopHover {
@@ -798,10 +843,26 @@ func renderFrame() {
 	if closeHover {
 		closeBrush = brushRed
 	}
-	d2dText(pRenderTarget, "×", fmtTitle, closeBrush,
-		rectF(float32(CLOSE_X), float32(CLOSE_Y)-1, float32(CLOSE_X+CLOSE_SIZE)+4, float32(CLOSE_Y+CLOSE_SIZE)+2))
+	d2dText(pRenderTarget, "×", fmtClose, closeBrush,
+		rectF(float32(CLOSE_X), float32(CLOSE_Y)-3, float32(CLOSE_X+CLOSE_SIZE)+6, float32(CLOSE_Y+CLOSE_SIZE)+4))
 
-	// Thin divider
+	// Transparency slider
+	s := float32(SLIDER_X)
+	sW := float32(SLIDER_W)
+	sY := float32(SLIDER_Y) + 2
+	// track
+	d2dFillRect(pRenderTarget, brushGreenMuted, rectF(s, sY, s+sW, sY+10))
+	// thumb
+	thumbW := float32(SLIDER_THUMB_W)
+	thumbRange := sW - thumbW
+	thumbX := s + float32(alphaValue)/255.0*thumbRange
+	thBr := brushGreenDim
+	if dragSlider {
+		thBr = brushGreen
+	}
+	d2dFillRoundedRect(pRenderTarget, thBr, rectF(thumbX, sY-2, thumbX+thumbW, sY+14), 4, 4)
+
+	// Divider
 	d2dFillRect(pRenderTarget, brushGreenDim, rectF(18, 48, W-18, 49))
 
 	// ── Chat messages (scrollable) ───────────────────────────────────────
@@ -824,7 +885,7 @@ func renderFrame() {
 	offset := scrollOffset
 	scrollMutex.Unlock()
 
-	// Pre‑compute heights from the local slice (no race)
+	// Pre‑compute heights from the local slice
 	msgHeights := make([]float32, len(messages))
 	var localTotalH float32
 	for i, msg := range messages {
@@ -842,42 +903,76 @@ func renderFrame() {
 		}
 	}
 
-	yPos := contentY0
+	firstY := viewBottom - localTotalH - offset
+	// If content is shorter than view, pin to top
+	if localTotalH < viewBottom-viewTop {
+		firstY = viewTop
+	}
+
+	yPos := firstY
 	for i := 0; i < len(messages); i++ {
 		msg := messages[i]
 		msgH := msgHeights[i]
+		// skip if completely above visible area
 		if yPos+msgH < viewTop {
 			yPos += msgH
 			continue
 		}
+		// stop if below visible area
 		if yPos > viewBottom {
 			break
 		}
+
 		if msg.Role == "user" {
-			d2dText(pRenderTarget, "You", fmtBadge, brushGreenDim, rectF(18, yPos, 50, yPos+labelH))
-			yPos += labelH
+			// user bubble – right aligned
+			bubbleW := float32(280)
+			bubbleX := float32(WIN_W) - bubbleW - 20
+			bubbleY := yPos
+			d2dFillRoundedRect(pRenderTarget, brushUserBubble, rectF(bubbleX, bubbleY, bubbleX+bubbleW, bubbleY+msgH), 8, 8)
+			d2dText(pRenderTarget, "You", fmtBadge, brushGreenDim, rectF(bubbleX+8, bubbleY+2, bubbleX+50, bubbleY+labelH))
+			lineY := bubbleY + labelH
 			for _, line := range msg.Lines {
-				if yPos > viewBottom {
+				if lineY > viewBottom {
 					break
 				}
-				d2dText(pRenderTarget, line, fmtBody, brushTextMain, rectF(18, yPos, WIN_W-18, yPos+lineH))
-				yPos += lineH
+				d2dText(pRenderTarget, line, fmtBody, brushTextMain, rectF(bubbleX+8, lineY, bubbleX+bubbleW-8, lineY+lineH))
+				lineY += lineH
 			}
 		} else {
+			// AI message – full width, no bubble
 			d2dText(pRenderTarget, "AI", fmtBadge, brushGreen, rectF(18, yPos, 40, yPos+labelH))
-			yPos += labelH
+			lineY := yPos + labelH
 			for _, line := range msg.Lines {
-				if yPos > viewBottom {
+				if lineY > viewBottom {
 					break
 				}
-				d2dText(pRenderTarget, line, fmtBody, brushGreen, rectF(18, yPos, WIN_W-18, yPos+lineH))
-				yPos += lineH
+				d2dText(pRenderTarget, line, fmtBody, brushTextMain, rectF(18, lineY, float32(WIN_W)-18, lineY+lineH))
+				lineY += lineH
 			}
 		}
-		yPos += gap
+		yPos += msgH
 	}
 
-	// ── Live partial transcript (user speaking) ─────────────────────────────
+	// ── Scrollbar ───────────────────────────────────────────────────────
+	if localTotalH > availableH {
+		frac := availableH / localTotalH
+		barH := frac * (viewBottom - viewTop)
+		if barH < 20 {
+			barH = 20
+		}
+		maxScroll := localTotalH - availableH
+		scrollFrac := float32(0)
+		if maxScroll > 0 {
+			scrollFrac = offset / maxScroll
+			if scrollFrac > 1 {
+				scrollFrac = 1
+			}
+		}
+		barY := viewTop + scrollFrac*((viewBottom-viewTop)-barH)
+		d2dFillRect(pRenderTarget, brushGreenDim, rectF(W-6, barY, W-4, barY+barH))
+	}
+
+	// ── Live partial transcript (user speaking) ─────────────────────────
 	partialMutex.RLock()
 	partial := partialTranscript
 	partialMutex.RUnlock()
@@ -889,10 +984,11 @@ func renderFrame() {
 		if (time.Now().UnixNano()/400000000)%2 == 0 {
 			cursor = "▌"
 		}
-		d2dText(pRenderTarget, partial+cursor, fmtBody, brushTextDim, rectF(18, partialY+labelH, WIN_W-18, partialY+labelH+lineH))
+		d2dText(pRenderTarget, partial+cursor, fmtBody, brushTextDim,
+			rectF(50, partialY, W-18, partialY+lineH))
 	}
 
-	// ── AI streaming / processing indicator ─────────────────────────────────
+	// ── AI streaming / processing indicator ─────────────────────────────
 	partialAIResponseMutex.Lock()
 	aiPartial := partialAIResponse
 	partialAIResponseMutex.Unlock()
@@ -904,11 +1000,11 @@ func renderFrame() {
 		if (time.Now().UnixNano()/400000000)%2 == 0 {
 			cursor = "▌"
 		}
-		d2dText(pRenderTarget, aiPartial+cursor, fmtBody, brushGreen, rectF(40, aiY, WIN_W-18, aiY+lineH))
+		d2dText(pRenderTarget, aiPartial+cursor, fmtBody, brushTextMain, rectF(40, aiY, W-18, aiY+lineH))
 	} else if isProcessing && !isAIResponding {
 		n := int(time.Now().Unix() % 4)
 		dots := strings.Repeat(".", n)
-		d2dText(pRenderTarget, "AI"+dots, fmtBadge, brushGreen, rectF(18, aiY, WIN_W-18, aiY+lineH))
+		d2dText(pRenderTarget, "AI"+dots, fmtBadge, brushGreen, rectF(18, aiY, W-18, aiY+lineH))
 	}
 
 	comCall(pRenderTarget, 49, 0, 0) // EndDraw
@@ -933,7 +1029,8 @@ func connectAssemblyAI() error {
 	params.Add("sample_rate", fmt.Sprintf("%d", SAMPLE_RATE))
 	params.Add("format_turns", "true")
 	params.Add("speech_model", "u3-rt-pro")
-	params.Add("end_of_turn_sensitivity", "0.8")
+	params.Add("min_turn_silence", "600")  // Wait 600ms of silence before checking for end-of-turn
+	params.Add("max_turn_silence", "2000") // Force end-of-turn after 2 seconds of silence
 
 	wsURL := fmt.Sprintf("%s?%s", ASSEMBLYAI_WS_URL, params.Encode())
 	headers := http.Header{}
@@ -970,8 +1067,16 @@ func handleAssemblyAIResponses() {
 		if conn == nil {
 			break
 		}
+
+		// 30‑second deadline – only fired if the connection is genuinely dead.
+		if err := conn.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+			fmt.Printf("❌ AssemblyAI set deadline error: %v\n", err)
+			break
+		}
+
 		msgType, data, err := conn.ReadMessage()
 		if err != nil {
+			// Any error (timeout, close, network) – treat as disconnection.
 			fmt.Printf("❌ AssemblyAI read error: %v\n", err)
 			aaiMutex.Lock()
 			aaiConnected = false
@@ -979,9 +1084,11 @@ func handleAssemblyAIResponses() {
 			aaiMutex.Unlock()
 			break
 		}
+
 		if msgType == websocket.BinaryMessage {
 			continue
 		}
+
 		var baseMsg AAIBaseMessage
 		if err := json.Unmarshal(data, &baseMsg); err != nil {
 			continue
@@ -1021,10 +1128,13 @@ func handleTurnMessage(msg AAITurnMessage) {
 	}
 
 	if msg.TurnIsFormatted {
+		// ── final transcript received ─────────────────────────
+		// store the final transcript
 		transcriptMutex.Lock()
 		currentTranscript = msg.Transcript
 		transcriptMutex.Unlock()
 
+		// clear partial
 		partialMutex.Lock()
 		partialTranscript = ""
 		partialMutex.Unlock()
@@ -1040,12 +1150,46 @@ func handleTurnMessage(msg AAITurnMessage) {
 		isProcessing = false
 		isAIResponding = false
 
+		// Clear any streaming partial
 		partialAIResponseMutex.Lock()
 		partialAIResponse = ""
 		partialAIResponseMutex.Unlock()
 
-		go sendToAI(msg.Transcript)
+		// ── debounced send (300ms after final) ─────────────────
+		// capture the transcript locally so it never changes while we wait
+		finalTranscript := msg.Transcript
+
+		// Cancel any previously scheduled send
+		pendingSendCancelMux.Lock()
+		if pendingSendCancel != nil {
+			pendingSendCancel()
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		pendingSendCancel = cancel
+		pendingSendCancelMux.Unlock()
+
+		go func(transcript string) {
+			select {
+			case <-time.After(300 * time.Millisecond):
+				// delay passed → send to AI
+				if transcript != "" {
+					sendToAI(transcript)
+				}
+			case <-ctx.Done():
+				// cancelled because new speech arrived
+			}
+		}(finalTranscript)
+
 	} else if !msg.EndOfTurn {
+		// ── partial transcript (speaking) ─────────────────────
+		// Cancel any pending final‑turn processor (speaker hasn't finished yet)
+		pendingSendCancelMux.Lock()
+		if pendingSendCancel != nil {
+			pendingSendCancel()
+			pendingSendCancel = nil
+		}
+		pendingSendCancelMux.Unlock()
+
 		partialMutex.Lock()
 		partialTranscript = msg.Transcript
 		partialMutex.Unlock()
@@ -1291,7 +1435,11 @@ func stopSession() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 func streamAIResponse(ctx context.Context, userText string) {
+
+	procSetTimer.Call(uintptr(hwndMain), TIMER_AI_POLL, 50, 0) // 50ms refresh while streaming
+
 	defer func() {
+		procSetTimer.Call(uintptr(hwndMain), TIMER_AI_POLL, 500, 0) // back to normal
 		// Cleanup when function exits (finished or cancelled)
 		partialAIResponseMutex.Lock()
 		partialAIResponse = ""
@@ -1576,7 +1724,7 @@ func wndProc(hwnd windows.Handle, msg uint32, wParam uintptr, lParam uintptr) ui
 		var wr RECT
 		procGetWindowRect.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&wr)))
 		cx, cy := lx-wr.Left, ly-wr.Top
-		if inCloseBtn(cx, cy) || inStopBtn(cx, cy) || inPowerBtn(cx, cy) {
+		if inCloseBtn(cx, cy) || inStopBtn(cx, cy) || inPowerBtn(cx, cy) || inSliderArea(cx, cy) {
 			return 1 // HTCLIENT – allow button clicks
 		}
 		if inChatArea(cx, cy) {
@@ -1677,23 +1825,43 @@ func wndProc(hwnd windows.Handle, msg uint32, wParam uintptr, lParam uintptr) ui
 			}
 			return 0
 		}
-
-		// Only start scrolling if we are in the chat area
+		// Start slider drag
+		if inSliderArea(x, y) {
+			dragSlider = true
+			procSetCapture.Call(uintptr(hwnd))
+			updateAlphaFromMouse(x)
+			return 0
+		}
+		// Start chat scroll drag
 		if inChatArea(x, y) {
 			scrollDragging = true
 			dragStartY = y
 			scrollMutex.Lock()
 			dragStartOffset = scrollOffset
 			scrollMutex.Unlock()
-			procSetCapture.Call(uintptr(hwnd)) // receive mouse move even outside window
+			procSetCapture.Call(uintptr(hwnd))
 			return 0
 		}
 		return 0
 
 	case WM_MOUSEMOVE:
+		x := int32(lParam & 0xFFFF)
+		y := int32((lParam >> 16) & 0xFFFF)
+		if inSliderArea(x, y) && !dragSlider {
+			// show hand cursor
+			hCur, _, _ := procLoadCursorW.Call(0, uintptr(IDC_HAND))
+			procSetCursor.Call(hCur)
+		} else if !scrollDragging {
+			// default arrow (IDC_ARROW = 32512)
+			hCur, _, _ := procLoadCursorW.Call(0, 32512)
+			procSetCursor.Call(hCur)
+		}
+		if dragSlider {
+			updateAlphaFromMouse(int32(lParam & 0xFFFF))
+		}
 		if scrollDragging {
 			y := int32((lParam >> 16) & 0xFFFF)
-			delta := dragStartY - y // dragging up (negative delta) → scroll down
+			delta := dragStartY - y
 			scrollMutex.Lock()
 			scrollOffset = dragStartOffset + float32(delta)
 			clampScroll()
@@ -1703,10 +1871,23 @@ func wndProc(hwnd windows.Handle, msg uint32, wParam uintptr, lParam uintptr) ui
 		return 0
 
 	case WM_LBUTTONUP:
+		if dragSlider {
+			dragSlider = false
+			procReleaseCapture.Call()
+		}
 		if scrollDragging {
 			scrollDragging = false
 			procReleaseCapture.Call()
 		}
+		return 0
+
+	case WM_MOUSEWHEEL:
+		delta := int16(int32(wParam) >> 16)
+		scrollMutex.Lock()
+		scrollOffset -= float32(delta) / 120 * 40
+		clampScroll()
+		scrollMutex.Unlock()
+		procInvalidateRect.Call(uintptr(hwnd), 0, 1)
 		return 0
 	}
 	ret, _, _ := procDefWindowProcW.Call(uintptr(hwnd), uintptr(msg), wParam, lParam)
