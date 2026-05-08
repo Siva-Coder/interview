@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"os"
 
-	// "os"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -56,23 +55,21 @@ const (
 
 	VK_ESCAPE = 0x1B
 
-	DWM_BB_ENABLE = 0x00000001
-
 	WIN_W = 460
 	WIN_H = 500
 
 	// Close button
-	CLOSE_X    int32 = WIN_W - 36
+	CLOSE_X    int32 = WIN_W - 38
 	CLOSE_Y    int32 = 14
-	CLOSE_SIZE int32 = 20
+	CLOSE_SIZE int32 = 22
 
-	// Hand Cursoe
+	// Hand Cursor
 	IDC_HAND = 32649
 
 	// Stop/resume button (left of close)
-	STOP_X    int32 = WIN_W - 64
+	STOP_X    int32 = WIN_W - 68
 	STOP_Y    int32 = 14
-	STOP_SIZE int32 = 20
+	STOP_SIZE int32 = 22
 
 	// Transparency slider (left of stop button)
 	SLIDER_X       int32 = 190
@@ -91,6 +88,7 @@ const (
 	TIMER_REFRESH   = 1
 	TIMER_AI_POLL   = 2
 	TIMER_AUDIO_CAP = 3
+	TIMER_PING      = 4 // keepalive ping timer
 
 	// Direct2D / DirectWrite
 	D2D1_FACTORY_TYPE_SINGLE_THREADED                 = 0
@@ -120,6 +118,22 @@ const (
 	// AssemblyAI
 	ASSEMBLYAI_WS_URL = "wss://streaming.assemblyai.com/v3/ws"
 	SAMPLE_RATE       = 16000
+)
+
+// ═══════════════════════════════════════════════════════════════════════════
+//
+//	Segoe Fluent Icons (PUA codepoints) - preinstalled on Windows 11
+//
+// ═══════════════════════════════════════════════════════════════════════════
+const (
+	ICON_PLAY       = "\uE768" // Play
+	ICON_PAUSE      = "\uE769" // Pause
+	ICON_STOP       = "\uE71A" // Stop
+	ICON_CLOSE      = "\uE711" // Cancel / X
+	ICON_MIC        = "\uE720" // Microphone
+	ICON_SEND       = "\uE724" // Send
+	ICON_SETTINGS   = "\uE713" // Setting
+	ICON_CHEVRON_UP = "\uE70E" // ChevronUp
 )
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -461,6 +475,7 @@ var (
 	procBeginPaint                 = user32.NewProc("BeginPaint")
 	procEndPaint                   = user32.NewProc("EndPaint")
 	procSetTimer                   = user32.NewProc("SetTimer")
+	procKillTimer                  = user32.NewProc("KillTimer")
 	procGetWindowRect              = user32.NewProc("GetWindowRect")
 	procGetCursorPos               = user32.NewProc("GetCursorPos")
 	procInvalidateRect             = user32.NewProc("InvalidateRect")
@@ -501,16 +516,18 @@ func rectF(l, t, r, b float32) D2D1_RECT_F { return D2D1_RECT_F{l, t, r, b} }
 
 var (
 	clrBg         = rgba(0x0D, 0x0D, 0x18, 1.0)
+	clrHeaderBg   = rgba(0x0D, 0x0D, 0x18, 1.0) // opaque header
 	clrGreen      = rgba(0x34, 0xd3, 0x99, 1)
 	clrGreenDim   = rgba(0x10, 0x99, 0x66, 1)
 	clrGreenMuted = rgba(0x0a, 0x5c, 0x40, 1)
 	clrTextMain   = rgba(0xf0, 0xf4, 0xff, 1)
 	clrTextDim    = rgba(0x9a, 0xa2, 0xb8, 1)
 	clrRed        = rgba(0xf8, 0x71, 0x71, 1)
-	clrBtnBg      = rgba(0x23, 0x8b, 0x5a, 1) // dark green for power button
+	clrBtnBg      = rgba(0x23, 0x8b, 0x5a, 1)
 	clrRedBright  = rgba(0xff, 0x4d, 0x4d, 1)
-	clrUserBubble = rgba(0x1a, 0x2d, 0x42, 0.9) // dark blue
-	clrAiBubble   = rgba(0x12, 0x2e, 0x25, 0.9) // dark green
+	clrUserBubble = rgba(0x1a, 0x3d, 0x6a, 0.9)
+	clrAiLine     = rgba(0x34, 0xd3, 0x99, 0.25) // subtle left accent line for AI
+	clrBorder     = rgba(0xff, 0xff, 0xff, 0.08)
 )
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -526,16 +543,17 @@ var (
 	brushTextMain, brushTextDim, brushRed, brushBtnBg   uintptr
 	brushRedBright                                      uintptr
 	brushUserBubble                                     uintptr
-	brushAiBubble                                       uintptr
+	brushAiLine                                         uintptr
+	brushBorder                                         uintptr
+	brushHeaderBg                                       uintptr
 
-	fmtTitle, fmtSub, fmtBody, fmtBadge, fmtSmall uintptr
+	fmtTitle, fmtSub, fmtBody, fmtBadge, fmtSmall, fmtIcon uintptr
 
 	hwndMain   windows.Handle
 	windowX    int32
 	windowY    int32
 	closeHover bool
 	stopHover  bool
-	fmtClose   uintptr
 )
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -594,12 +612,25 @@ var (
 	scrollDragging  bool
 	dragStartY      int32
 	dragStartOffset float32
-	alphaValue      uint8 = 215 // current transparency (215 = slightly transparent)
+	alphaValue      uint8 = 215 // body transparency only
 	dragSlider      bool
-	sliderThumbPos  int32 // not used, but keep if needed
 
 	pendingSendCancel    context.CancelFunc
 	pendingSendCancelMux sync.Mutex
+
+	// UX: track if user manually scrolled
+	userScrolled bool
+
+	// Track last speech activity for smarter debouncing
+	lastSpeechTime  time.Time
+	lastSpeechMutex sync.Mutex
+
+	lastAudioActivity  time.Time
+	audioActivityMutex sync.Mutex
+	silenceThresholdMs int64 = 1500 // must be silent for 1.5s before sending
+
+	aaiReconnecting bool
+	aaiReconnectMux sync.Mutex
 )
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -679,19 +710,29 @@ func updateTotalMessageHeight() {
 	defer convMutex.RUnlock()
 
 	totalMsgHeight = 0
-	labelH := float32(16)
-	lineH := float32(20)
-	gap := float32(10)
+	labelH := float32(18)
+	lineH := float32(22)
+	gap := float32(12)
 
 	for _, msg := range conversation {
 		totalMsgHeight += labelH + float32(len(msg.Lines))*lineH + gap
+	}
+
+	// Include streaming AI message height so clamping works during generation
+	partialAIResponseMutex.Lock()
+	aiPartial := partialAIResponse
+	streaming := isAIResponding && aiPartial != ""
+	partialAIResponseMutex.Unlock()
+
+	if streaming {
+		totalMsgHeight += labelH + float32(len(wrapText(aiPartial, 52)))*lineH + gap
 	}
 }
 
 // clamp scrollOffset to valid range
 func clampScroll() {
-	available := float32(WIN_H) - 60 - 60
-	maxScroll := totalMsgHeight - available
+	availableH := float32(WIN_H) - 54 - 46 // chat view area
+	maxScroll := totalMsgHeight - availableH
 	if maxScroll < 0 {
 		maxScroll = 0
 	}
@@ -704,8 +745,7 @@ func clampScroll() {
 }
 
 func inChatArea(x, y int32) bool {
-	// chat area: from y=60 to y=WIN_H-60, full width
-	return y >= 60 && y <= WIN_H-60
+	return y >= 54 && y <= WIN_H-46
 }
 
 func inSliderArea(x, y int32) bool {
@@ -774,14 +814,18 @@ func initD2D(hwnd uintptr) error {
 	brushBtnBg = createBrush(pRenderTarget, clrBtnBg)
 	brushRedBright = createBrush(pRenderTarget, clrRedBright)
 	brushUserBubble = createBrush(pRenderTarget, clrUserBubble)
-	brushAiBubble = createBrush(pRenderTarget, clrAiBubble)
+	brushAiLine = createBrush(pRenderTarget, clrAiLine)
+	brushBorder = createBrush(pRenderTarget, clrBorder)
+	brushHeaderBg = createBrush(pRenderTarget, clrHeaderBg)
 
-	fmtTitle = createTextFormat("Segoe UI Variable", DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 17)
-	fmtSub = createTextFormat("Segoe UI Variable", DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 12)
-	fmtBody = createTextFormat("Segoe UI Variable", DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 13)
-	fmtBadge = createTextFormat("Segoe UI Variable", DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 10)
-	fmtSmall = createTextFormat("Segoe UI Variable", DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 10)
-	fmtClose = createTextFormat("Segoe UI Variable", DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 22)
+	// Larger font sizes for better readability
+	fmtTitle = createTextFormat("Segoe UI Variable", DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 19)
+	fmtSub = createTextFormat("Segoe UI Variable", DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 13)
+	fmtBody = createTextFormat("Segoe UI Variable", DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 15)
+	fmtBadge = createTextFormat("Segoe UI Variable", DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 11)
+	fmtSmall = createTextFormat("Segoe UI Variable", DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 11)
+	// Segoe Fluent Icons font for icons - size 18 for header buttons
+	fmtIcon = createTextFormat("Segoe Fluent Icons", DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 18)
 
 	return nil
 }
@@ -796,90 +840,53 @@ func renderFrame() {
 	}
 	W := float32(WIN_W)
 
-	comCall(pRenderTarget, 48)                                  // BeginDraw
-	comCall(pRenderTarget, 47, uintptr(unsafe.Pointer(&clrBg))) // Clear
+	comCall(pRenderTarget, 48) // BeginDraw
+
+	// FIX 1: Clear with FULLY OPAQUE background first, then apply window alpha via layered attrib
+	// The layered window alpha applies to the ENTIRE window, so we must draw opaque header on top
+	opaqueBg := rgba(0x0D, 0x0D, 0x18, 1.0)
+	comCall(pRenderTarget, 47, uintptr(unsafe.Pointer(&opaqueBg))) // Clear opaque
 
 	sessionMutex.Lock()
 	active := sessionActive
 	sessionMutex.Unlock()
 
-	// ── Header ──────────────────────────────────────────────────────────
-	d2dText(pRenderTarget, "Candy", fmtTitle, brushGreen, rectF(18, 12, 70, 42))
-	d2dText(pRenderTarget, " Ai", fmtTitle, brushGreenDim, rectF(74, 12, 160, 42))
+	// ── Glass border ────────────────────────────────────────────────────
+	borderRR := D2D1_ROUNDED_RECT{Rect: rectF(0.5, 0.5, W-0.5, float32(WIN_H)-0.5), RadiusX: 20, RadiusY: 20}
+	comCall(pRenderTarget, 18, uintptr(unsafe.Pointer(&borderRR)), brushBorder, uintptr(mathFloat32bits(1.0)), 0)
 
-	// Live status dot
-	aaiMutex.RLock()
-	aaiConn := aaiConnected
-	aaiMutex.RUnlock()
-	dotBrush := brushGreenMuted
-	if isListening && aaiConn && active {
-		dotBrush = brushGreen
-	}
-	d2dFillEllipse(pRenderTarget, dotBrush, 110, 27, 4, 4)
-
-	// Stop / resume button (RED when active)
-	var stopIcon string
-	if active {
-		stopIcon = "■"
-	} else {
-		stopIcon = "▶"
-	}
-	stopBr := brushGreenDim
-	if active {
-		stopBr = brushRed
-		if stopHover {
-			stopBr = brushRedBright
-		}
-	} else {
-		if stopHover {
-			stopBr = brushGreen
-		}
-	}
-	d2dText(pRenderTarget, stopIcon, fmtTitle, stopBr,
-		rectF(float32(STOP_X)-1, float32(STOP_Y), float32(STOP_X+STOP_SIZE)+2, float32(STOP_Y+STOP_SIZE)+2))
-
-	// Close button
-	closeBrush := brushTextDim
-	if closeHover {
-		closeBrush = brushRed
-	}
-	d2dText(pRenderTarget, "×", fmtClose, closeBrush,
-		rectF(float32(CLOSE_X), float32(CLOSE_Y)-3, float32(CLOSE_X+CLOSE_SIZE)+6, float32(CLOSE_Y+CLOSE_SIZE)+4))
-
-	// Transparency slider
-	s := float32(SLIDER_X)
-	sW := float32(SLIDER_W)
-	sY := float32(SLIDER_Y) + 2
-	// track
-	d2dFillRect(pRenderTarget, brushGreenMuted, rectF(s, sY, s+sW, sY+10))
-	// thumb
-	thumbW := float32(SLIDER_THUMB_W)
-	thumbRange := sW - thumbW
-	thumbX := s + float32(alphaValue)/255.0*thumbRange
-	thBr := brushGreenDim
-	if dragSlider {
-		thBr = brushGreen
-	}
-	d2dFillRoundedRect(pRenderTarget, thBr, rectF(thumbX, sY-2, thumbX+thumbW, sY+14), 4, 4)
-
-	// Divider
-	d2dFillRect(pRenderTarget, brushGreenDim, rectF(18, 48, W-18, 49))
-
-	// ── Chat messages (scrollable) ───────────────────────────────────────
+	// ── Chat content (drawn FIRST, will be covered by opaque header) ────
+	// This ensures any chat text scrolling up gets hidden behind the header
 	const (
-		viewTop       = float32(60)
-		bottomReserve = float32(60)
+		viewTop    = float32(54)
+		viewBottom = float32(WIN_H) - 46
 	)
-	viewBottom := float32(WIN_H) - bottomReserve
+	availableH := viewBottom - viewTop
 
-	lineH := float32(20)
-	labelH := float32(16)
-	gap := float32(10)
+	lineH := float32(22)
+	labelH := float32(18)
+	gap := float32(12)
 
 	convMutex.RLock()
 	messages := make([]Message, len(conversation))
 	copy(messages, conversation)
 	convMutex.RUnlock()
+
+	// Append virtual AI message if streaming so it scrolls naturally
+	partialAIResponseMutex.Lock()
+	aiPartial := partialAIResponse
+	streaming := isAIResponding && aiPartial != ""
+	partialAIResponseMutex.Unlock()
+
+	if streaming {
+		virtualMsg := Message{
+			Role:      "assistant",
+			Text:      aiPartial,
+			Lines:     wrapText(aiPartial, 52),
+			Timestamp: time.Now(),
+		}
+		messages = append(messages, virtualMsg)
+	}
 
 	scrollMutex.Lock()
 	offset := scrollOffset
@@ -894,18 +901,9 @@ func renderFrame() {
 		localTotalH += h
 	}
 
-	availableH := viewBottom - viewTop
-	contentY0 := viewTop
-	if localTotalH > availableH {
-		contentY0 = viewBottom - localTotalH - offset
-		if contentY0 > viewTop {
-			contentY0 = viewTop
-		}
-	}
-
-	firstY := viewBottom - localTotalH - offset
+	firstY := viewBottom - localTotalH + offset
 	// If content is shorter than view, pin to top
-	if localTotalH < viewBottom-viewTop {
+	if localTotalH < availableH {
 		firstY = viewTop
 	}
 
@@ -923,30 +921,45 @@ func renderFrame() {
 			break
 		}
 
+		isVirtual := (i == len(messages)-1 && streaming)
+
 		if msg.Role == "user" {
 			// user bubble – right aligned
-			bubbleW := float32(280)
-			bubbleX := float32(WIN_W) - bubbleW - 20
+			bubbleW := float32(300)
+			bubbleX := W - bubbleW - 20
 			bubbleY := yPos
-			d2dFillRoundedRect(pRenderTarget, brushUserBubble, rectF(bubbleX, bubbleY, bubbleX+bubbleW, bubbleY+msgH), 8, 8)
-			d2dText(pRenderTarget, "You", fmtBadge, brushGreenDim, rectF(bubbleX+8, bubbleY+2, bubbleX+50, bubbleY+labelH))
-			lineY := bubbleY + labelH
+			d2dFillRoundedRect(pRenderTarget, brushUserBubble, rectF(bubbleX, bubbleY, bubbleX+bubbleW, bubbleY+msgH), 12, 12)
+			d2dText(pRenderTarget, "You", fmtBadge, brushGreenDim, rectF(bubbleX+10, bubbleY+6, bubbleX+50, bubbleY+labelH+6))
+			lineY := bubbleY + labelH + 4
 			for _, line := range msg.Lines {
 				if lineY > viewBottom {
 					break
 				}
-				d2dText(pRenderTarget, line, fmtBody, brushTextMain, rectF(bubbleX+8, lineY, bubbleX+bubbleW-8, lineY+lineH))
+				d2dText(pRenderTarget, line, fmtBody, brushTextMain, rectF(bubbleX+10, lineY, bubbleX+bubbleW-10, lineY+lineH))
 				lineY += lineH
 			}
 		} else {
-			// AI message – full width, no bubble
-			d2dText(pRenderTarget, "AI", fmtBadge, brushGreen, rectF(18, yPos, 40, yPos+labelH))
-			lineY := yPos + labelH
-			for _, line := range msg.Lines {
+			// AI message – FULL WIDTH, no bubble, just a subtle left accent line
+			textX := float32(22)
+			textW := W - 22 - 8
+			msgY := yPos
+
+			// Subtle left accent line
+			d2dFillRect(pRenderTarget, brushAiLine, rectF(18, msgY+2, 20, msgY+msgH-2))
+
+			d2dText(pRenderTarget, "AI", fmtBadge, brushGreen, rectF(textX, msgY+4, textX+40, msgY+labelH+4))
+			lineY := msgY + labelH + 4
+			for li, line := range msg.Lines {
 				if lineY > viewBottom {
 					break
 				}
-				d2dText(pRenderTarget, line, fmtBody, brushTextMain, rectF(18, lineY, float32(WIN_W)-18, lineY+lineH))
+				displayLine := line
+				if isVirtual && li == len(msg.Lines)-1 {
+					if (time.Now().UnixNano()/400000000)%2 == 0 {
+						displayLine += "▌"
+					}
+				}
+				d2dText(pRenderTarget, displayLine, fmtBody, brushTextMain, rectF(textX, lineY, textW, lineY+lineH))
 				lineY += lineH
 			}
 		}
@@ -956,7 +969,7 @@ func renderFrame() {
 	// ── Scrollbar ───────────────────────────────────────────────────────
 	if localTotalH > availableH {
 		frac := availableH / localTotalH
-		barH := frac * (viewBottom - viewTop)
+		barH := frac * availableH
 		if barH < 20 {
 			barH = 20
 		}
@@ -967,45 +980,114 @@ func renderFrame() {
 			if scrollFrac > 1 {
 				scrollFrac = 1
 			}
+			if scrollFrac < 0 {
+				scrollFrac = 0
+			}
 		}
-		barY := viewTop + scrollFrac*((viewBottom-viewTop)-barH)
-		d2dFillRect(pRenderTarget, brushGreenDim, rectF(W-6, barY, W-4, barY+barH))
+		barY := viewBottom - barH - scrollFrac*(availableH-barH)
+		d2dFillRoundedRect(pRenderTarget, brushGreenDim, rectF(W-5, barY, W-2, barY+barH), 3, 3)
 	}
 
-	// ── Live partial transcript (user speaking) ─────────────────────────
+	// ── Footer: Live partial transcript & Typing indicator ──────────────
+	footerY := float32(WIN_H) - 36
+
 	partialMutex.RLock()
 	partial := partialTranscript
 	partialMutex.RUnlock()
 
-	const partialY = float32(WIN_H) - 58
 	if partial != "" {
-		d2dText(pRenderTarget, "You", fmtBadge, brushGreenMuted, rectF(18, partialY, 50, partialY+labelH))
+		d2dText(pRenderTarget, "You", fmtBadge, brushGreenMuted, rectF(18, footerY, 50, footerY+labelH))
 		cursor := ""
 		if (time.Now().UnixNano()/400000000)%2 == 0 {
 			cursor = "▌"
 		}
 		d2dText(pRenderTarget, partial+cursor, fmtBody, brushTextDim,
-			rectF(50, partialY, W-18, partialY+lineH))
-	}
-
-	// ── AI streaming / processing indicator ─────────────────────────────
-	partialAIResponseMutex.Lock()
-	aiPartial := partialAIResponse
-	partialAIResponseMutex.Unlock()
-
-	const aiY = float32(WIN_H) - 30
-	if isAIResponding && aiPartial != "" {
-		d2dText(pRenderTarget, "AI", fmtBadge, brushGreen, rectF(18, aiY, 40, aiY+labelH))
-		cursor := ""
-		if (time.Now().UnixNano()/400000000)%2 == 0 {
-			cursor = "▌"
-		}
-		d2dText(pRenderTarget, aiPartial+cursor, fmtBody, brushTextMain, rectF(40, aiY, W-18, aiY+lineH))
+			rectF(50, footerY, W-18, footerY+lineH))
 	} else if isProcessing && !isAIResponding {
-		n := int(time.Now().Unix() % 4)
-		dots := strings.Repeat(".", n)
-		d2dText(pRenderTarget, "AI"+dots, fmtBadge, brushGreen, rectF(18, aiY, W-18, aiY+lineH))
+		// Animated pulsing dots
+		t := float64(time.Now().UnixNano()) / 1e9
+		dotBaseX := float32(40)
+		dotY := footerY + 8
+		for i := 0; i < 3; i++ {
+			phase := t*4.0 + float64(i)*2.1
+			scale := float32(0.4 + 0.6*math.Sin(phase))
+			if scale < 0 {
+				scale = 0
+			}
+			r := float32(2 + 2*scale)
+			d2dFillEllipse(pRenderTarget, brushGreen, dotBaseX+float32(i)*14, dotY, r, r)
+		}
+		d2dText(pRenderTarget, "Thinking", fmtSmall, brushTextDim, rectF(82, footerY+2, 200, footerY+18))
 	}
+
+	// ═════════════════════════════════════════════════════════════════════
+	//  HEADER (drawn LAST so it covers any chat content underneath)
+	// ═════════════════════════════════════════════════════════════════════
+	headerH := float32(54)
+	// Opaque header background - covers everything underneath
+	d2dFillRect(pRenderTarget, brushHeaderBg, rectF(0, 0, W, headerH))
+
+	// Title
+	d2dText(pRenderTarget, "Candy", fmtTitle, brushGreen, rectF(18, 12, 80, 44))
+	d2dText(pRenderTarget, " Ai", fmtTitle, brushGreenDim, rectF(82, 12, 170, 44))
+
+	// Live status dot
+	aaiMutex.RLock()
+	aaiConn := aaiConnected
+	aaiMutex.RUnlock()
+	dotBrush := brushGreenMuted
+	if isListening && aaiConn && active {
+		dotBrush = brushGreen
+	}
+	d2dFillEllipse(pRenderTarget, dotBrush, 118, 28, 5, 5)
+
+	// Stop / resume button using Segoe Fluent Icons
+	var stopIcon string
+	if active {
+		stopIcon = ICON_STOP // Stop square icon
+	} else {
+		stopIcon = ICON_PLAY // Play triangle icon
+	}
+	stopBr := brushGreenDim
+	if active {
+		stopBr = brushRed
+		if stopHover {
+			stopBr = brushRedBright
+		}
+	} else {
+		if stopHover {
+			stopBr = brushGreen
+		}
+	}
+	d2dText(pRenderTarget, stopIcon, fmtIcon, stopBr,
+		rectF(float32(STOP_X), float32(STOP_Y), float32(STOP_X+STOP_SIZE), float32(STOP_Y+STOP_SIZE)))
+
+	// Close button using Segoe Fluent Icons (Cancel/X)
+	closeBrush := brushTextDim
+	if closeHover {
+		closeBrush = brushRed
+	}
+	d2dText(pRenderTarget, ICON_CLOSE, fmtIcon, closeBrush,
+		rectF(float32(CLOSE_X), float32(CLOSE_Y), float32(CLOSE_X+CLOSE_SIZE), float32(CLOSE_Y+CLOSE_SIZE)))
+
+	// Transparency slider
+	s := float32(SLIDER_X)
+	sW := float32(SLIDER_W)
+	sY := float32(SLIDER_Y) + 2
+	// track
+	d2dFillRect(pRenderTarget, brushGreenMuted, rectF(s, sY, s+sW, sY+10))
+	// thumb
+	thumbW := float32(SLIDER_THUMB_W)
+	thumbRange := sW - thumbW
+	thumbX := s + float32(alphaValue)/255.0*thumbRange
+	thBr := brushGreenDim
+	if dragSlider {
+		thBr = brushGreen
+	}
+	d2dFillRoundedRect(pRenderTarget, thBr, rectF(thumbX, sY-2, thumbX+thumbW, sY+14), 4, 4)
+
+	// Divider line at bottom of header
+	d2dFillRect(pRenderTarget, brushGreenDim, rectF(18, 48, W-18, 49))
 
 	comCall(pRenderTarget, 49, 0, 0) // EndDraw
 }
@@ -1029,14 +1111,19 @@ func connectAssemblyAI() error {
 	params.Add("sample_rate", fmt.Sprintf("%d", SAMPLE_RATE))
 	params.Add("format_turns", "true")
 	params.Add("speech_model", "u3-rt-pro")
-	params.Add("min_turn_silence", "600")  // Wait 600ms of silence before checking for end-of-turn
-	params.Add("max_turn_silence", "2000") // Force end-of-turn after 2 seconds of silence
+	// FIX 5: Increase silence thresholds so AI waits longer before deciding turn is complete
+	params.Add("min_turn_silence", "100")  // Wait 1.2s of silence before checking for end-of-turn
+	params.Add("max_turn_silence", "1000") // Force end-of-turn after 3 seconds of silence
 
 	wsURL := fmt.Sprintf("%s?%s", ASSEMBLYAI_WS_URL, params.Encode())
 	headers := http.Header{}
 	headers.Add("Authorization", assemblyAIKey)
 
-	dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 10 * time.Second,
+		// Keepalive from client side
+		EnableCompression: true,
+	}
 	conn, resp, err := dialer.Dial(wsURL, headers)
 	if err != nil {
 		if resp != nil {
@@ -1047,6 +1134,13 @@ func connectAssemblyAI() error {
 		}
 		return err
 	}
+
+	// Configure connection for longevity
+	conn.SetReadDeadline(time.Time{}) // Clear any deadline - we handle timeouts ourselves
+	// FIX 2: Enable ping/pong keepalive to prevent i/o timeout
+	conn.SetPingHandler(func(appData string) error {
+		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(5*time.Second))
+	})
 
 	aaiMutex.Lock()
 	aaiWSConn = conn
@@ -1060,6 +1154,35 @@ func connectAssemblyAI() error {
 
 func handleAssemblyAIResponses() {
 	fmt.Println("👂 AssemblyAI response handler started")
+
+	// Start ping ticker to keep connection alive
+	pingTicker := time.NewTicker(10 * time.Second)
+	defer pingTicker.Stop()
+
+	pingDone := make(chan struct{})
+	defer close(pingDone)
+
+	// Run ping in separate goroutine
+	go func() {
+		for {
+			select {
+			case <-pingTicker.C:
+				aaiMutex.RLock()
+				conn := aaiWSConn
+				aaiMutex.RUnlock()
+				if conn == nil {
+					return
+				}
+				// Send ping frame
+				if err := conn.WriteControl(websocket.PingMessage, []byte("keepalive"), time.Now().Add(5*time.Second)); err != nil {
+					fmt.Printf("⚠️ AssemblyAI ping failed: %v\n", err)
+				}
+			case <-pingDone:
+				return
+			}
+		}
+	}()
+
 	for {
 		aaiMutex.RLock()
 		conn := aaiWSConn
@@ -1068,20 +1191,29 @@ func handleAssemblyAIResponses() {
 			break
 		}
 
-		// 30‑second deadline – only fired if the connection is genuinely dead.
-		if err := conn.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
-			fmt.Printf("❌ AssemblyAI set deadline error: %v\n", err)
-			break
-		}
-
 		msgType, data, err := conn.ReadMessage()
 		if err != nil {
 			// Any error (timeout, close, network) – treat as disconnection.
 			fmt.Printf("❌ AssemblyAI read error: %v\n", err)
 			aaiMutex.Lock()
-			aaiConnected = false
-			aaiWSConn = nil
+			if aaiWSConn == conn {
+				aaiConnected = false
+				aaiWSConn = nil
+			}
 			aaiMutex.Unlock()
+
+			// Auto-reconnect if session is still active
+			sessionMutex.Lock()
+			shouldReconnect := sessionActive
+			sessionMutex.Unlock()
+
+			if shouldReconnect {
+				fmt.Println("🔄 Attempting to reconnect to AssemblyAI...")
+				time.Sleep(2 * time.Second) // Brief backoff
+				if err := connectAssemblyAI(); err != nil {
+					fmt.Printf("❌ Reconnection failed: %v\n", err)
+				}
+			}
 			break
 		}
 
@@ -1107,9 +1239,22 @@ func handleAssemblyAIResponses() {
 			json.Unmarshal(data, &msg)
 			fmt.Printf("🔴 Session terminated\n")
 			aaiMutex.Lock()
-			aaiConnected = false
-			aaiWSConn = nil
+			if aaiWSConn == conn {
+				aaiConnected = false
+				aaiWSConn = nil
+			}
 			aaiMutex.Unlock()
+
+			// Auto-reconnect on termination if session still active
+			sessionMutex.Lock()
+			shouldReconnect := sessionActive
+			sessionMutex.Unlock()
+
+			if shouldReconnect {
+				fmt.Println("🔄 Session terminated, reconnecting...")
+				time.Sleep(1 * time.Second)
+				connectAssemblyAI()
+			}
 			return
 		}
 	}
@@ -1127,7 +1272,12 @@ func handleTurnMessage(msg AAITurnMessage) {
 		return
 	}
 
-	if msg.TurnIsFormatted {
+	// Update last speech time for debounce logic
+	lastSpeechMutex.Lock()
+	lastSpeechTime = time.Now()
+	lastSpeechMutex.Unlock()
+
+	if msg.EndOfTurn {
 		// ── final transcript received ─────────────────────────
 		// store the final transcript
 		transcriptMutex.Lock()
@@ -1155,8 +1305,8 @@ func handleTurnMessage(msg AAITurnMessage) {
 		partialAIResponse = ""
 		partialAIResponseMutex.Unlock()
 
-		// ── debounced send (300ms after final) ─────────────────
-		// capture the transcript locally so it never changes while we wait
+		// ── debounced send (800ms after final) ─────────────────
+		// FIX 5: Increased from 300ms to 800ms to let user finish their thought
 		finalTranscript := msg.Transcript
 
 		// Cancel any previously scheduled send
@@ -1168,28 +1318,28 @@ func handleTurnMessage(msg AAITurnMessage) {
 		pendingSendCancel = cancel
 		pendingSendCancelMux.Unlock()
 
-		go func(transcript string) {
+		go func(transcript string, ctx context.Context) {
 			select {
-			case <-time.After(300 * time.Millisecond):
-				// delay passed → send to AI
+			case <-time.After(400 * time.Millisecond):
 				if transcript != "" {
-					sendToAI(transcript)
+					// Double-check we haven't received new speech
+					lastSpeechMutex.Lock()
+					sinceLastSpeech := time.Since(lastSpeechTime)
+					lastSpeechMutex.Unlock()
+
+					// Only send if no new speech arrived during debounce window
+					if sinceLastSpeech >= 400*time.Millisecond {
+						sendToAI(transcript)
+					}
 				}
 			case <-ctx.Done():
-				// cancelled because new speech arrived
+				// cancelled because new turn arrived
 			}
-		}(finalTranscript)
+		}(finalTranscript, ctx)
 
-	} else if !msg.EndOfTurn {
-		// ── partial transcript (speaking) ─────────────────────
-		// Cancel any pending final‑turn processor (speaker hasn't finished yet)
-		pendingSendCancelMux.Lock()
-		if pendingSendCancel != nil {
-			pendingSendCancel()
-			pendingSendCancel = nil
-		}
-		pendingSendCancelMux.Unlock()
-
+	} else {
+		// ── PARTIAL transcript (speaking) ─────────────────────
+		// Just update the UI, don't trigger any AI logic
 		partialMutex.Lock()
 		partialTranscript = msg.Transcript
 		partialMutex.Unlock()
@@ -1212,17 +1362,20 @@ func sendAudioToAssemblyAI(audioData []byte) error {
 }
 
 func disconnectAssemblyAI() {
+	// FIX: avoid deadlock by grabbing conn pointer under lock, then closing outside lock
 	aaiMutex.Lock()
-	defer aaiMutex.Unlock()
-	if aaiWSConn != nil {
+	conn := aaiWSConn
+	aaiWSConn = nil
+	aaiConnected = false
+	aaiMutex.Unlock()
+
+	if conn != nil {
 		terminate := AAITerminateMessage{Type: "Terminate"}
 		data, _ := json.Marshal(terminate)
-		aaiWSConn.WriteMessage(websocket.TextMessage, data)
+		conn.WriteMessage(websocket.TextMessage, data)
 		time.Sleep(200 * time.Millisecond)
-		aaiWSConn.Close()
-		aaiWSConn = nil
+		conn.Close()
 	}
-	aaiConnected = false
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1321,7 +1474,17 @@ func audioTick() {
 
 	if hr == 0 && framesAvailable > 0 {
 		bytesAvailable := uint32(framesAvailable) * uint32(audioFormat.NBlockAlign)
+
 		if flags&AUDCLNT_BUFFERFLAGS_SILENT == 0 {
+			audioActivityMutex.Lock()
+			lastAudioActivity = time.Now()
+			audioActivityMutex.Unlock()
+			data := unsafe.Slice((*byte)(unsafe.Pointer(pData)), bytesAvailable)
+			converted := convertAudioFormat(data)
+			audioMutex.Lock()
+			audioBuffer = append(audioBuffer, converted...)
+			audioMutex.Unlock()
+		} else {
 			data := unsafe.Slice((*byte)(unsafe.Pointer(pData)), bytesAvailable)
 			converted := convertAudioFormat(data)
 			audioMutex.Lock()
@@ -1357,7 +1520,7 @@ func stopAudioDevice() {
 			comCall(pAudioClient, 11) // Stop
 		}
 		audioStarted = false
-		procSetTimer.Call(uintptr(hwndMain), TIMER_AUDIO_CAP, 20, 0) // kill timer
+		procKillTimer.Call(uintptr(hwndMain), TIMER_AUDIO_CAP) // actually kill the timer
 	}
 }
 
@@ -1386,7 +1549,7 @@ func startSession() {
 			sessionMutex.Unlock()
 			return
 		}
-		// Set audio capture timer (10ms)
+		// Set audio capture timer (20ms)
 		procSetTimer.Call(uintptr(hwndMain), TIMER_AUDIO_CAP, 20, 0)
 	} else {
 		// Audio already set up, just restart client if stopped
@@ -1395,6 +1558,12 @@ func startSession() {
 	}
 
 	isListening = true
+
+	// Initialize audio activity tracker
+	audioActivityMutex.Lock()
+	lastAudioActivity = time.Now()
+	audioActivityMutex.Unlock()
+
 	fmt.Println("▶ Session started")
 	if hwndMain != 0 {
 		procInvalidateRect.Call(uintptr(hwndMain), 0, 1)
@@ -1435,8 +1604,8 @@ func stopSession() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 func streamAIResponse(ctx context.Context, userText string) {
-
-	procSetTimer.Call(uintptr(hwndMain), TIMER_AI_POLL, 50, 0) // 50ms refresh while streaming
+	// 60fps refresh while streaming for smooth typing feel
+	procSetTimer.Call(uintptr(hwndMain), TIMER_AI_POLL, 16, 0)
 
 	defer func() {
 		procSetTimer.Call(uintptr(hwndMain), TIMER_AI_POLL, 500, 0) // back to normal
@@ -1483,7 +1652,8 @@ func streamAIResponse(ctx context.Context, userText string) {
 	req.Header.Set("Authorization", "Bearer "+geminiKey)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 0} // no timeout, controlled by context
+	// FIX 3: Add timeout to prevent indefinite hanging
+	client := &http.Client{Timeout: 60 * time.Second} // 60s max for entire request
 	resp, err := client.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -1507,6 +1677,11 @@ func streamAIResponse(ctx context.Context, userText string) {
 	go func() {
 		defer close(done)
 		scanner := bufio.NewScanner(resp.Body)
+		// FIX 3: Limit scanner buffer to prevent memory explosion on malformed data
+		const maxScanTokenSize = 64 * 1024 // 64KB max per SSE line
+		buf := make([]byte, 4096)
+		scanner.Buffer(buf, maxScanTokenSize)
+
 		for scanner.Scan() {
 			line := scanner.Text()
 			if !strings.HasPrefix(line, "data: ") {
@@ -1536,6 +1711,20 @@ func streamAIResponse(ctx context.Context, userText string) {
 				partialAIResponseMutex.Lock()
 				partialAIResponse = fullResponse.String()
 				partialAIResponseMutex.Unlock()
+
+				// Keep scroll height accurate so clamping works
+				updateTotalMessageHeight()
+
+				// FIX 4: Only auto-scroll if user hasn't manually scrolled
+				scrollMutex.Lock()
+				if !userScrolled {
+					scrollOffset = 0
+				}
+				scrollMutex.Unlock()
+
+				if hwndMain != 0 {
+					procInvalidateRect.Call(uintptr(hwndMain), 0, 1)
+				}
 			}
 
 			// Stop early if context cancelled (new speech detected)
@@ -1553,7 +1742,17 @@ func streamAIResponse(ctx context.Context, userText string) {
 
 	select {
 	case <-ctx.Done():
-		resp.Body.Close() // force close to unblock scanner
+		// FIX 3: Force close body with timeout to prevent hanging on cancellation
+		doneClosing := make(chan struct{})
+		go func() {
+			resp.Body.Close()
+			close(doneClosing)
+		}()
+		select {
+		case <-doneClosing:
+		case <-time.After(2 * time.Second):
+			fmt.Println("⚠️ Force closing response body timed out")
+		}
 	case <-done:
 	}
 
@@ -1565,13 +1764,14 @@ func streamAIResponse(ctx context.Context, userText string) {
 	// Append assistant message to conversation
 	convMutex.Lock()
 	conversation = append(conversation, Message{
-		Role: "assistant", Text: answer, Lines: wrapText(answer, 54), Timestamp: time.Now(),
+		Role: "assistant", Text: answer, Lines: wrapText(answer, 52), Timestamp: time.Now(),
 	})
 	convMutex.Unlock()
 
 	updateTotalMessageHeight()
 	scrollMutex.Lock()
 	scrollOffset = 0
+	userScrolled = false
 	scrollMutex.Unlock()
 }
 
@@ -1581,13 +1781,14 @@ func sendToAI(userText string) {
 
 	convMutex.Lock()
 	conversation = append(conversation, Message{
-		Role: "user", Text: userText, Lines: wrapText(userText, 54), Timestamp: time.Now(),
+		Role: "user", Text: userText, Lines: wrapText(userText, 52), Timestamp: time.Now(),
 	})
 	convMutex.Unlock()
 
 	updateTotalMessageHeight()
 	scrollMutex.Lock()
-	scrollOffset = 0 // jump to bottom
+	scrollOffset = 0
+	userScrolled = false
 	scrollMutex.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1779,6 +1980,7 @@ func wndProc(hwnd windows.Handle, msg uint32, wParam uintptr, lParam uintptr) ui
 			scrollMutex.Lock()
 			scrollOffset += 40 // scroll up 40px
 			clampScroll()
+			userScrolled = (scrollOffset != 0)
 			scrollMutex.Unlock()
 			procInvalidateRect.Call(uintptr(hwnd), 0, 1)
 			return 0
@@ -1786,9 +1988,8 @@ func wndProc(hwnd windows.Handle, msg uint32, wParam uintptr, lParam uintptr) ui
 		if wParam == 0x28 { // VK_DOWN
 			scrollMutex.Lock()
 			scrollOffset -= 40
-			if scrollOffset < 0 {
-				scrollOffset = 0
-			}
+			clampScroll()
+			userScrolled = (scrollOffset != 0)
 			scrollMutex.Unlock()
 			procInvalidateRect.Call(uintptr(hwnd), 0, 1)
 			return 0
@@ -1865,6 +2066,7 @@ func wndProc(hwnd windows.Handle, msg uint32, wParam uintptr, lParam uintptr) ui
 			scrollMutex.Lock()
 			scrollOffset = dragStartOffset + float32(delta)
 			clampScroll()
+			userScrolled = (scrollOffset != 0)
 			scrollMutex.Unlock()
 			procInvalidateRect.Call(uintptr(hwnd), 0, 1)
 		}
@@ -1884,8 +2086,9 @@ func wndProc(hwnd windows.Handle, msg uint32, wParam uintptr, lParam uintptr) ui
 	case WM_MOUSEWHEEL:
 		delta := int16(int32(wParam) >> 16)
 		scrollMutex.Lock()
-		scrollOffset -= float32(delta) / 120 * 40
+		scrollOffset += float32(delta) / 120 * 40
 		clampScroll()
+		userScrolled = (scrollOffset != 0)
 		scrollMutex.Unlock()
 		procInvalidateRect.Call(uintptr(hwnd), 0, 1)
 		return 0
@@ -1974,7 +2177,7 @@ func splitWords(s string) []string {
 func main() {
 	assemblyAIKey = os.Getenv("ASSEMBLYAI_API_KEY")
 	geminiKey = os.Getenv("GEMINI_API_KEY")
-
+	fmt.Println(assemblyAIKey, geminiKey)
 	fmt.Println("═══════════════════════════════════════════")
 	fmt.Println("  Candy AI — Interview Copilot (v2)")
 	fmt.Println("═══════════════════════════════════════════")
