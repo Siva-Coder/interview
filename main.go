@@ -569,11 +569,12 @@ var (
 // ═══════════════════════════════════════════════════════════════════════════
 
 type Message struct {
-	Role      string
-	Text      string
-	Lines     []string
-	Spans     []RichTextSpan
-	Timestamp time.Time
+	Role         string
+	Text         string
+	Lines        []string
+	Spans        []RichTextSpan
+	WrappedSpans []RichTextSpan
+	Timestamp    time.Time
 }
 
 var (
@@ -753,9 +754,9 @@ func updateTotalMessageHeight() {
 	partialAIResponseMutex.Unlock()
 
 	if streaming {
-		streamSpans := parseMarkdown(aiPartial)
-		wrapped := wrapMarkdownSpans(streamSpans, 52)
-		totalMsgHeight += labelH + float32(len(wrapped))*lineH + gap
+		// Estimate height without parsing markdown
+		lineCount := len(wrapText(aiPartial, 52))
+		totalMsgHeight += labelH + float32(lineCount)*lineH + gap
 	}
 }
 
@@ -1019,10 +1020,17 @@ func renderFrame() {
 	partialAIResponseMutex.Unlock()
 
 	if streaming {
+		// Plain-text virtual message — no markdown parsing during stream
+		lines := wrapText(aiPartial, 52)
+		var plainSpans []RichTextSpan
+		for _, line := range lines {
+			plainSpans = append(plainSpans, RichTextSpan{Text: line})
+		}
 		virtualMsg := Message{
-			Role:      "assistant",
-			Text:      aiPartial,
-			Spans:     parseMarkdown(aiPartial), // parse markdown so it renders correctly while streaming
+			Role: "assistant",
+			Text: aiPartial,
+			// Spans:     parseMarkdown(aiPartial), // parse markdown so it renders correctly while streaming
+			Spans:     plainSpans,
 			Timestamp: time.Now(),
 		}
 		messages = append(messages, virtualMsg)
@@ -1037,7 +1045,14 @@ func renderFrame() {
 	for _, msg := range messages {
 		var spans []RichTextSpan
 		if len(msg.Spans) > 0 {
-			spans = wrapMarkdownSpans(msg.Spans, 52)
+			// Use cached wrapped spans if available and message is finalized
+			if msg.Role == "assistant" && len(msg.WrappedSpans) > 0 && !streaming {
+				spans = msg.WrappedSpans
+			} else if msg.Role == "user" && len(msg.WrappedSpans) > 0 {
+				spans = msg.WrappedSpans
+			} else {
+				spans = wrapMarkdownSpans(msg.Spans, 52)
+			}
 		} else {
 			// Fallback for old messages without spans
 			for _, line := range msg.Lines {
@@ -1305,20 +1320,22 @@ func connectAssemblyAI() error {
 	// (Re-)create the audio send channel and start its draining goroutine.
 	// The old channel (if any) is replaced; the goroutine for the previous
 	// connection will exit when it detects the connection is gone.
-	audioSendCh = make(chan []byte, 100)
-	go func(ch chan []byte) {
-		for chunk := range ch {
-			aaiMutex.RLock()
-			c := aaiWSConn
-			aaiMutex.RUnlock()
-			if c == nil {
-				return
+	if audioSendCh == nil {
+		audioSendCh = make(chan []byte, 100)
+		go func(ch chan []byte) {
+			for chunk := range ch {
+				aaiMutex.RLock()
+				c := aaiWSConn
+				aaiMutex.RUnlock()
+				if c == nil {
+					return
+				}
+				if err := c.WriteMessage(websocket.BinaryMessage, chunk); err != nil {
+					return
+				}
 			}
-			if err := c.WriteMessage(websocket.BinaryMessage, chunk); err != nil {
-				return
-			}
-		}
-	}(audioSendCh)
+		}(audioSendCh)
+	}
 
 	return nil
 }
@@ -1538,6 +1555,13 @@ func disconnectAssemblyAI() {
 	conn := aaiWSConn
 	aaiWSConn = nil
 	aaiConnected = false
+
+	// Close old channel to unblock sender goroutine
+	if audioSendCh != nil {
+		close(audioSendCh)
+		audioSendCh = nil
+	}
+
 	aaiMutex.Unlock()
 
 	if conn != nil {
@@ -1946,12 +1970,14 @@ func streamAIResponse(ctx context.Context, userText string) {
 
 	// Append assistant message to conversation
 	aiSpans := parseMarkdown(answer)
+	wrapped := wrapMarkdownSpans(aiSpans, 52)
 	convMutex.Lock()
 	conversation = append(conversation, Message{
-		Role:      "assistant",
-		Text:      answer,
-		Spans:     aiSpans,
-		Timestamp: time.Now(),
+		Role:         "assistant",
+		Text:         answer,
+		Spans:        aiSpans,
+		WrappedSpans: wrapped,
+		Timestamp:    time.Now(),
 	})
 	convMutex.Unlock()
 
@@ -1968,13 +1994,14 @@ func sendToAI(userText string) {
 
 	// Parse user text (minimal markdown)
 	userSpans := parseMarkdown(userText)
-
+	wrapped := wrapMarkdownSpans(userSpans, 52)
 	convMutex.Lock()
 	conversation = append(conversation, Message{
-		Role:      "user",
-		Text:      userText,
-		Spans:     userSpans,
-		Timestamp: time.Now(),
+		Role:         "user",
+		Text:         userText,
+		Spans:        userSpans,
+		WrappedSpans: wrapped,
+		Timestamp:    time.Now(),
 	})
 	convMutex.Unlock()
 
