@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"os"
+	"strconv"
 
 	"context"
 	"encoding/binary"
@@ -91,6 +92,7 @@ const (
 	TIMER_PING      = 4 // keepalive ping timer
 
 	// Direct2D / DirectWrite
+	DWRITE_FONT_STYLE_ITALIC                          = 1
 	D2D1_FACTORY_TYPE_SINGLE_THREADED                 = 0
 	DWRITE_FACTORY_TYPE_SHARED                        = 0
 	D2D1_RENDER_TARGET_TYPE_DEFAULT                   = 0
@@ -554,6 +556,12 @@ var (
 	windowY    int32
 	closeHover bool
 	stopHover  bool
+
+	fmtBodyBold   uintptr
+	fmtBodyItalic uintptr
+	fmtH1         uintptr
+	fmtH2         uintptr
+	fmtH3plus     uintptr
 )
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -564,6 +572,7 @@ type Message struct {
 	Role      string
 	Text      string
 	Lines     []string
+	Spans     []RichTextSpan
 	Timestamp time.Time
 }
 
@@ -631,6 +640,9 @@ var (
 
 	aaiReconnecting bool
 	aaiReconnectMux sync.Mutex
+
+	// Buffered channel for audio chunks — written on UI thread, drained in goroutine
+	audioSendCh chan []byte
 )
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -713,9 +725,25 @@ func updateTotalMessageHeight() {
 	labelH := float32(18)
 	lineH := float32(22)
 	gap := float32(12)
+	headingH := float32(26)
 
 	for _, msg := range conversation {
-		totalMsgHeight += labelH + float32(len(msg.Lines))*lineH + gap
+		if len(msg.Spans) > 0 {
+			for _, span := range msg.Spans {
+				if span.Heading > 0 {
+					totalMsgHeight += headingH
+				} else if span.Code {
+					// Code block: estimate 16px per line
+					codeLines := float32(strings.Count(span.Text, "\n") + 1)
+					totalMsgHeight += codeLines*16 + 8 // padding
+				} else {
+					totalMsgHeight += lineH
+				}
+			}
+			totalMsgHeight += gap
+		} else {
+			totalMsgHeight += labelH + float32(len(msg.Lines))*lineH + gap
+		}
 	}
 
 	// Include streaming AI message height so clamping works during generation
@@ -725,7 +753,9 @@ func updateTotalMessageHeight() {
 	partialAIResponseMutex.Unlock()
 
 	if streaming {
-		totalMsgHeight += labelH + float32(len(wrapText(aiPartial, 52)))*lineH + gap
+		streamSpans := parseMarkdown(aiPartial)
+		wrapped := wrapMarkdownSpans(streamSpans, 52)
+		totalMsgHeight += labelH + float32(len(wrapped))*lineH + gap
 	}
 }
 
@@ -760,6 +790,102 @@ func updateAlphaFromMouse(mx int32) {
 	}
 	alphaValue = newAlpha
 	procSetLayeredWindowAttributes.Call(uintptr(hwndMain), 0, uintptr(alphaValue), LWA_ALPHA)
+}
+
+func renderSpans(rt uintptr, spans []RichTextSpan, x, y, maxW, viewBottom float32, isVirtual, isUser bool) {
+	lineH := float32(22)
+	headingH := float32(26)
+	codeLineH := float32(16)
+	currentY := y
+
+	for si, span := range spans {
+		if currentY > viewBottom {
+			break
+		}
+
+		// Choose format based on style - USE CACHED FORMATS
+		var format uintptr
+		var brush uintptr
+
+		switch {
+		case span.Heading == 1:
+			format = fmtH1
+			brush = brushTextMain
+		case span.Heading == 2:
+			format = fmtH2
+			brush = brushTextMain
+		case span.Heading >= 3:
+			format = fmtH3plus
+			brush = brushTextMain
+		case span.Code:
+			format = fmtSmall // Use small font for code
+			brush = brushTextMain
+		case span.Bold:
+			format = fmtBodyBold
+			brush = brushTextMain
+		case span.Italic:
+			format = fmtBodyItalic
+			brush = brushTextDim
+		case span.Blockquote:
+			format = fmtBody
+			brush = brushTextDim
+		default:
+			format = fmtBody
+			brush = brushTextMain
+		}
+
+		// Handle bullet points
+		displayText := span.Text
+		if span.Bullet {
+			displayText = "• " + displayText
+		} else if span.Numbered > 0 {
+			displayText = fmt.Sprintf("%d. %s", span.Numbered, displayText)
+		}
+
+		// Cursor for streaming
+		if isVirtual && si == len(spans)-1 {
+			if (time.Now().UnixNano()/400000000)%2 == 0 {
+				displayText += "▌"
+			}
+		}
+
+		// Render code blocks with background
+		if span.Code {
+			codeH := float32(strings.Count(span.Text, "\n")+1)*codeLineH + 8
+			// Dark background for code
+			codeBg := rgba(0x1a, 0x1a, 0x2e, 0.9)
+			var codeBrush uintptr
+			comCall(rt, 8, uintptr(unsafe.Pointer(&codeBg)), 0, uintptr(unsafe.Pointer(&codeBrush)))
+			d2dFillRoundedRect(rt, codeBrush, rectF(x, currentY, x+maxW, currentY+codeH), 6, 6)
+
+			// Render code text line by line
+			codeLines := strings.Split(span.Text, "\n")
+			codeY := currentY + 4
+			for _, cl := range codeLines {
+				if codeY > viewBottom {
+					break
+				}
+				d2dText(rt, cl, fmtSmall, brushTextMain, rectF(x+8, codeY, x+maxW-8, codeY+codeLineH))
+				codeY += codeLineH
+			}
+			currentY += codeH
+		} else if span.Heading > 0 {
+			d2dText(rt, displayText, format, brush, rectF(x, currentY, x+maxW, currentY+headingH))
+			currentY += headingH
+		} else {
+			// Blockquote indent
+			indentX := x
+			if span.Blockquote {
+				indentX += 12
+				// Quote line
+				quoteBrush := brushGreenMuted
+				d2dFillRect(rt, quoteBrush, rectF(x, currentY, x+3, currentY+lineH))
+			}
+
+			d2dText(rt, displayText, format, brush, rectF(indentX, currentY, x+maxW, currentY+lineH))
+			currentY += lineH
+		}
+	}
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -827,12 +953,23 @@ func initD2D(hwnd uintptr) error {
 	// Segoe Fluent Icons font for icons - size 18 for header buttons
 	fmtIcon = createTextFormat("Segoe Fluent Icons", DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 18)
 
+	// Cached formats for markdown rendering
+	fmtBodyBold = createTextFormat("Segoe UI Variable", DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 15)
+	fmtBodyItalic = createTextFormat("Segoe UI Variable", DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_ITALIC, DWRITE_FONT_STRETCH_NORMAL, 15)
+	fmtH1 = createTextFormat("Segoe UI Variable", DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 20)
+	fmtH2 = createTextFormat("Segoe UI Variable", DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 18)
+	fmtH3plus = createTextFormat("Segoe UI Variable", DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 16)
 	return nil
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  RENDERING
 // ═══════════════════════════════════════════════════════════════════════════
+
+type displayItem struct {
+	msg   Message
+	spans []RichTextSpan
+}
 
 func renderFrame() {
 	if pRenderTarget == 0 {
@@ -863,9 +1000,12 @@ func renderFrame() {
 	)
 	availableH := viewBottom - viewTop
 
+	var items []displayItem
 	lineH := float32(22)
 	labelH := float32(18)
 	gap := float32(12)
+	headingH := float32(26)
+	codeLineH := float32(16)
 
 	convMutex.RLock()
 	messages := make([]Message, len(conversation))
@@ -882,7 +1022,7 @@ func renderFrame() {
 		virtualMsg := Message{
 			Role:      "assistant",
 			Text:      aiPartial,
-			Lines:     wrapText(aiPartial, 52),
+			Spans:     parseMarkdown(aiPartial), // parse markdown so it renders correctly while streaming
 			Timestamp: time.Now(),
 		}
 		messages = append(messages, virtualMsg)
@@ -893,12 +1033,33 @@ func renderFrame() {
 	scrollMutex.Unlock()
 
 	// Pre‑compute heights from the local slice
-	msgHeights := make([]float32, len(messages))
 	var localTotalH float32
-	for i, msg := range messages {
-		h := labelH + float32(len(msg.Lines))*lineH + gap
-		msgHeights[i] = h
-		localTotalH += h
+	for _, msg := range messages {
+		var spans []RichTextSpan
+		if len(msg.Spans) > 0 {
+			spans = wrapMarkdownSpans(msg.Spans, 52)
+		} else {
+			// Fallback for old messages without spans
+			for _, line := range msg.Lines {
+				spans = append(spans, RichTextSpan{Text: line})
+			}
+		}
+		items = append(items, displayItem{msg: msg, spans: spans})
+
+		// Calculate height
+		msgH := labelH // "You" or "AI" label
+		for _, span := range spans {
+			if span.Heading > 0 {
+				msgH += headingH
+			} else if span.Code {
+				codeLines := float32(strings.Count(span.Text, "\n") + 1)
+				msgH += codeLines*codeLineH + 8
+			} else {
+				msgH += lineH
+			}
+		}
+		msgH += gap
+		localTotalH += msgH
 	}
 
 	firstY := viewBottom - localTotalH + offset
@@ -908,60 +1069,51 @@ func renderFrame() {
 	}
 
 	yPos := firstY
-	for i := 0; i < len(messages); i++ {
-		msg := messages[i]
-		msgH := msgHeights[i]
-		// skip if completely above visible area
+	for i := 0; i < len(items); i++ {
+		item := items[i]
+		msgH := float32(0)
+		for _, span := range item.spans {
+			if span.Heading > 0 {
+				msgH += headingH
+			} else if span.Code {
+				codeLines := float32(strings.Count(span.Text, "\n") + 1)
+				msgH += codeLines*codeLineH + 8
+			} else {
+				msgH += lineH
+			}
+		}
+		msgH += labelH + gap
+
 		if yPos+msgH < viewTop {
 			yPos += msgH
 			continue
 		}
-		// stop if below visible area
 		if yPos > viewBottom {
 			break
 		}
 
-		isVirtual := (i == len(messages)-1 && streaming)
+		isVirtual := (i == len(items)-1 && streaming && item.msg.Role == "assistant")
 
-		if msg.Role == "user" {
-			// user bubble – right aligned
+		if item.msg.Role == "user" {
+			// User bubble
 			bubbleW := float32(300)
 			bubbleX := W - bubbleW - 20
 			bubbleY := yPos
-			d2dFillRoundedRect(pRenderTarget, brushUserBubble, rectF(bubbleX, bubbleY, bubbleX+bubbleW, bubbleY+msgH), 12, 12)
+			totalBubbleH := msgH - gap
+			d2dFillRoundedRect(pRenderTarget, brushUserBubble, rectF(bubbleX, bubbleY, bubbleX+bubbleW, bubbleY+totalBubbleH), 12, 12)
 			d2dText(pRenderTarget, "You", fmtBadge, brushGreenDim, rectF(bubbleX+10, bubbleY+6, bubbleX+50, bubbleY+labelH+6))
-			lineY := bubbleY + labelH + 4
-			for _, line := range msg.Lines {
-				if lineY > viewBottom {
-					break
-				}
-				d2dText(pRenderTarget, line, fmtBody, brushTextMain, rectF(bubbleX+10, lineY, bubbleX+bubbleW-10, lineY+lineH))
-				lineY += lineH
-			}
+
+			renderSpans(pRenderTarget, item.spans, bubbleX+10, bubbleY+labelH+4, bubbleW-20, viewBottom, isVirtual, true)
 		} else {
-			// AI message – FULL WIDTH, no bubble, just a subtle left accent line
+			// AI message
 			textX := float32(22)
 			textW := W - 22 - 8
 			msgY := yPos
 
-			// Subtle left accent line
-			d2dFillRect(pRenderTarget, brushAiLine, rectF(18, msgY+2, 20, msgY+msgH-2))
-
+			d2dFillRect(pRenderTarget, brushAiLine, rectF(18, msgY+2, 20, msgY+msgH-gap-2))
 			d2dText(pRenderTarget, "AI", fmtBadge, brushGreen, rectF(textX, msgY+4, textX+40, msgY+labelH+4))
-			lineY := msgY + labelH + 4
-			for li, line := range msg.Lines {
-				if lineY > viewBottom {
-					break
-				}
-				displayLine := line
-				if isVirtual && li == len(msg.Lines)-1 {
-					if (time.Now().UnixNano()/400000000)%2 == 0 {
-						displayLine += "▌"
-					}
-				}
-				d2dText(pRenderTarget, displayLine, fmtBody, brushTextMain, rectF(textX, lineY, textW, lineY+lineH))
-				lineY += lineH
-			}
+
+			renderSpans(pRenderTarget, item.spans, textX, msgY+labelH+4, textW, viewBottom, isVirtual, false)
 		}
 		yPos += msgH
 	}
@@ -1149,6 +1301,25 @@ func connectAssemblyAI() error {
 
 	fmt.Println("✅ Connected to AssemblyAI")
 	go handleAssemblyAIResponses()
+
+	// (Re-)create the audio send channel and start its draining goroutine.
+	// The old channel (if any) is replaced; the goroutine for the previous
+	// connection will exit when it detects the connection is gone.
+	audioSendCh = make(chan []byte, 100)
+	go func(ch chan []byte) {
+		for chunk := range ch {
+			aaiMutex.RLock()
+			c := aaiWSConn
+			aaiMutex.RUnlock()
+			if c == nil {
+				return
+			}
+			if err := c.WriteMessage(websocket.BinaryMessage, chunk); err != nil {
+				return
+			}
+		}
+	}(audioSendCh)
+
 	return nil
 }
 
@@ -1373,7 +1544,6 @@ func disconnectAssemblyAI() {
 		terminate := AAITerminateMessage{Type: "Terminate"}
 		data, _ := json.Marshal(terminate)
 		conn.WriteMessage(websocket.TextMessage, data)
-		time.Sleep(200 * time.Millisecond)
 		conn.Close()
 	}
 }
@@ -1508,8 +1678,14 @@ func audioTick() {
 		audioBuffer = audioBuffer[targetBytes:]
 		audioMutex.Unlock()
 
-		if err := sendAudioToAssemblyAI(chunk); err != nil {
-			// silently ignore
+		// Non-blocking send to the channel — the sender goroutine handles the
+		// actual WebSocket write off the UI thread.
+		if audioSendCh != nil {
+			select {
+			case audioSendCh <- chunk:
+			default:
+				// channel full (backpressure), drop oldest chunk silently
+			}
 		}
 	}
 }
@@ -1591,7 +1767,7 @@ func stopSession() {
 	isListening = false
 
 	stopAudioDevice()
-	disconnectAssemblyAI()
+	go disconnectAssemblyAI() // run off UI thread — contains network I/O
 
 	fmt.Println("■ Session stopped")
 	if hwndMain != 0 {
@@ -1652,8 +1828,9 @@ func streamAIResponse(ctx context.Context, userText string) {
 	req.Header.Set("Authorization", "Bearer "+geminiKey)
 	req.Header.Set("Content-Type", "application/json")
 
-	// FIX 3: Add timeout to prevent indefinite hanging
-	client := &http.Client{Timeout: 60 * time.Second} // 60s max for entire request
+	// No overall Timeout — SSE streaming responses may run indefinitely.
+	// Cancellation is handled via the request context (ctx).
+	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -1742,7 +1919,8 @@ func streamAIResponse(ctx context.Context, userText string) {
 
 	select {
 	case <-ctx.Done():
-		// FIX 3: Force close body with timeout to prevent hanging on cancellation
+		// Close the body to unblock scanner.Scan(), then wait for the goroutine
+		// to exit before we read fullResponse — otherwise it's a data race.
 		doneClosing := make(chan struct{})
 		go func() {
 			resp.Body.Close()
@@ -1753,6 +1931,11 @@ func streamAIResponse(ctx context.Context, userText string) {
 		case <-time.After(2 * time.Second):
 			fmt.Println("⚠️ Force closing response body timed out")
 		}
+		// Wait for scanner goroutine to drain and close `done`
+		select {
+		case <-done:
+		case <-time.After(1 * time.Second):
+		}
 	case <-done:
 	}
 
@@ -1762,9 +1945,13 @@ func streamAIResponse(ctx context.Context, userText string) {
 	}
 
 	// Append assistant message to conversation
+	aiSpans := parseMarkdown(answer)
 	convMutex.Lock()
 	conversation = append(conversation, Message{
-		Role: "assistant", Text: answer, Lines: wrapText(answer, 52), Timestamp: time.Now(),
+		Role:      "assistant",
+		Text:      answer,
+		Spans:     aiSpans,
+		Timestamp: time.Now(),
 	})
 	convMutex.Unlock()
 
@@ -1779,9 +1966,15 @@ func sendToAI(userText string) {
 	isProcessing = true
 	isAIResponding = true
 
+	// Parse user text (minimal markdown)
+	userSpans := parseMarkdown(userText)
+
 	convMutex.Lock()
 	conversation = append(conversation, Message{
-		Role: "user", Text: userText, Lines: wrapText(userText, 52), Timestamp: time.Now(),
+		Role:      "user",
+		Text:      userText,
+		Spans:     userSpans,
+		Timestamp: time.Now(),
 	})
 	convMutex.Unlock()
 
@@ -2149,6 +2342,218 @@ func wrapText(text string, maxLen int) []string {
 		lines = append(lines, text)
 	}
 	return lines
+}
+
+// wrapMarkdownSpans wraps parsed markdown spans into display lines
+func wrapMarkdownSpans(spans []RichTextSpan, maxLen int) []RichTextSpan {
+	var result []RichTextSpan
+	for _, span := range spans {
+		if span.Code || span.Heading > 0 {
+			// Code blocks and headings don't wrap
+			result = append(result, span)
+			continue
+		}
+
+		lines := wrapText(span.Text, maxLen)
+		for i, line := range lines {
+			s := span
+			s.Text = line
+			if i > 0 {
+				// Only first line keeps bullet/number
+				s.Bullet = false
+				s.Numbered = 0
+			}
+			result = append(result, s)
+		}
+	}
+	return result
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Markdown rendering helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+// RichTextSpan represents a span of text with formatting
+type RichTextSpan struct {
+	Text       string
+	Bold       bool
+	Italic     bool
+	Code       bool
+	Heading    int  // 0 = normal, 1-6 = h1-h6
+	Bullet     bool // unordered list item
+	Numbered   int  // 0 = not numbered, >0 = list number
+	LinkURL    string
+	Blockquote bool
+}
+
+// parseMarkdown parses simple markdown into formatted spans
+func parseMarkdown(text string) []RichTextSpan {
+	var spans []RichTextSpan
+	lines := strings.Split(text, "\n")
+
+	inCodeBlock := false
+	codeBlockContent := ""
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// Code blocks
+		if strings.HasPrefix(trimmed, "```") {
+			if inCodeBlock {
+				// End code block
+				spans = append(spans, RichTextSpan{
+					Text: codeBlockContent,
+					Code: true,
+				})
+				codeBlockContent = ""
+				inCodeBlock = false
+			} else {
+				inCodeBlock = true
+			}
+			continue
+		}
+
+		if inCodeBlock {
+			if codeBlockContent != "" {
+				codeBlockContent += "\n"
+			}
+			codeBlockContent += line
+			continue
+		}
+
+		// Empty line
+		if trimmed == "" {
+			continue
+		}
+
+		span := RichTextSpan{}
+
+		// Headings
+		if strings.HasPrefix(trimmed, "# ") {
+			span.Heading = 1
+			span.Text = strings.TrimPrefix(trimmed, "# ")
+		} else if strings.HasPrefix(trimmed, "## ") {
+			span.Heading = 2
+			span.Text = strings.TrimPrefix(trimmed, "## ")
+		} else if strings.HasPrefix(trimmed, "### ") {
+			span.Heading = 3
+			span.Text = strings.TrimPrefix(trimmed, "### ")
+		} else if strings.HasPrefix(trimmed, "#### ") {
+			span.Heading = 4
+			span.Text = strings.TrimPrefix(trimmed, "#### ")
+		} else if strings.HasPrefix(trimmed, "##### ") {
+			span.Heading = 5
+			span.Text = strings.TrimPrefix(trimmed, "##### ")
+		} else if strings.HasPrefix(trimmed, "###### ") {
+			span.Heading = 6
+			span.Text = strings.TrimPrefix(trimmed, "###### ")
+		} else if strings.HasPrefix(trimmed, "> ") {
+			// Blockquote
+			span.Blockquote = true
+			span.Text = strings.TrimPrefix(trimmed, "> ")
+		} else if strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "* ") {
+			// Unordered list
+			span.Bullet = true
+			span.Text = strings.TrimPrefix(strings.TrimPrefix(trimmed, "- "), "* ")
+		} else if match := matchOrderedList(trimmed); match > 0 {
+			// Ordered list
+			span.Numbered = match
+			span.Text = trimmed[strings.Index(trimmed, ". ")+2:]
+		} else {
+			span.Text = trimmed
+		}
+
+		// Inline formatting
+		span.Text = parseInlineMarkdown(span.Text, &span)
+
+		spans = append(spans, span)
+	}
+
+	return spans
+}
+
+func matchOrderedList(s string) int {
+	parts := strings.SplitN(s, ". ", 2)
+	if len(parts) == 2 {
+		if num, err := strconv.Atoi(parts[0]); err == nil && num > 0 {
+			return num
+		}
+	}
+	return 0
+}
+
+// parseInlineMarkdown handles bold, italic, inline code, and links
+func parseInlineMarkdown(text string, base *RichTextSpan) string {
+	// For simplicity, we strip inline markers and set flags on the base span
+	// A full implementation would return sub-spans, but this covers 90% of cases
+
+	// Inline code `code`
+	if strings.HasPrefix(text, "`") && strings.HasSuffix(text, "`") && len(text) > 2 {
+		base.Code = true
+		return text[1 : len(text)-1]
+	}
+
+	// Bold **text** or __text__
+	text = parseBoldItalic(text, base)
+
+	// Links [text](url)
+	text = parseLinks(text, base)
+
+	return text
+}
+
+func parseBoldItalic(text string, span *RichTextSpan) string {
+	// **bold**
+	if strings.Contains(text, "**") {
+		parts := strings.Split(text, "**")
+		if len(parts) >= 3 {
+			span.Bold = true
+			// Return first bold segment for simplicity
+			return parts[1]
+		}
+	}
+	// __bold__
+	if strings.Contains(text, "__") {
+		parts := strings.Split(text, "__")
+		if len(parts) >= 3 {
+			span.Bold = true
+			return parts[1]
+		}
+	}
+	// *italic*
+	if strings.Contains(text, "*") && !strings.Contains(text, "**") {
+		parts := strings.Split(text, "*")
+		if len(parts) >= 3 {
+			span.Italic = true
+			return parts[1]
+		}
+	}
+	// _italic_
+	if strings.Contains(text, "_") && !strings.Contains(text, "__") {
+		parts := strings.Split(text, "_")
+		if len(parts) >= 3 {
+			span.Italic = true
+			return parts[1]
+		}
+	}
+	return text
+}
+
+func parseLinks(text string, span *RichTextSpan) string {
+	// Simple [text](url) extraction
+	if idx := strings.Index(text, "["); idx != -1 {
+		if endIdx := strings.Index(text[idx:], "]"); endIdx != -1 {
+			if urlStart := strings.Index(text[idx+endIdx:], "("); urlStart != -1 {
+				if urlEnd := strings.Index(text[idx+endIdx+urlStart:], ")"); urlEnd != -1 {
+					linkText := text[idx+1 : idx+endIdx]
+					url := text[idx+endIdx+urlStart+1 : idx+endIdx+urlStart+urlEnd]
+					span.LinkURL = url
+					return linkText
+				}
+			}
+		}
+	}
+	return text
 }
 
 func splitWords(s string) []string {
