@@ -118,6 +118,11 @@ const (
 	AUDCLNT_STREAMFLAGS_LOOPBACK = 0x00020000
 	S_OK                         = 0
 
+	// WAVE format tags
+	WAVE_FORMAT_PCM        = 0x0001
+	WAVE_FORMAT_IEEE_FLOAT = 0x0003
+	WAVE_FORMAT_EXTENSIBLE = 0xFFFE
+
 	// AssemblyAI
 	ASSEMBLYAI_WS_URL = "wss://streaming.assemblyai.com/v3/ws"
 	SAMPLE_RATE       = 16000
@@ -415,6 +420,15 @@ type WAVEFORMATEX struct {
 	CBSize          uint16
 }
 
+// audioFormatInfo holds the decoded properties we actually need for conversion.
+type audioFormatInfo struct {
+	sampleRate    int
+	channels      int
+	bitsPerSample int  // container bits per sample
+	validBits     int  // valid bits (may be less for 24-in-32 packed)
+	isFloat       bool // true = IEEE float, false = integer PCM
+}
+
 type WNDCLASSEXW struct {
 	CbSize        uint32
 	Style         uint32
@@ -563,6 +577,9 @@ var (
 	fmtH1         uintptr
 	fmtH2         uintptr
 	fmtH3plus     uintptr
+
+	aaiSessionReady    bool
+	aaiSessionReadyMux sync.Mutex
 )
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -606,6 +623,7 @@ var (
 	pAudioClient   uintptr
 	pCaptureClient uintptr
 	audioFormat    *WAVEFORMATEX
+	audioInfo      audioFormatInfo // decoded format properties (handles EXTENSIBLE)
 	audioStarted   bool
 	audioBuffer    []byte
 	audioMutex     sync.Mutex
@@ -1122,11 +1140,10 @@ func renderFrame() {
 			renderSpans(pRenderTarget, item.spans, bubbleX+10, bubbleY+labelH+4, bubbleW-20, viewBottom, isVirtual, true)
 		} else {
 			// AI message
-			textX := float32(22)
-			textW := W - 22 - 8
+			textX := float32(18)
+			textW := W - 18 - 8
 			msgY := yPos
 
-			d2dFillRect(pRenderTarget, brushAiLine, rectF(18, msgY+2, 20, msgY+msgH-gap-2))
 			d2dText(pRenderTarget, "AI", fmtBadge, brushGreen, rectF(textX, msgY+4, textX+40, msgY+labelH+4))
 
 			renderSpans(pRenderTarget, item.spans, textX, msgY+labelH+4, textW, viewBottom, isVirtual, false)
@@ -1279,17 +1296,15 @@ func connectAssemblyAI() error {
 	params.Add("sample_rate", fmt.Sprintf("%d", SAMPLE_RATE))
 	params.Add("format_turns", "true")
 	params.Add("speech_model", "u3-rt-pro")
-	// FIX 5: Increase silence thresholds so AI waits longer before deciding turn is complete
-	params.Add("min_turn_silence", "100")  // Wait 1.2s of silence before checking for end-of-turn
-	params.Add("max_turn_silence", "1000") // Force end-of-turn after 3 seconds of silence
+	params.Add("min_turn_silence", "100")
+	params.Add("max_turn_silence", "1000")
 
 	wsURL := fmt.Sprintf("%s?%s", ASSEMBLYAI_WS_URL, params.Encode())
 	headers := http.Header{}
 	headers.Add("Authorization", assemblyAIKey)
 
 	dialer := websocket.Dialer{
-		HandshakeTimeout: 10 * time.Second,
-		// Keepalive from client side
+		HandshakeTimeout:  10 * time.Second,
 		EnableCompression: true,
 	}
 	conn, resp, err := dialer.Dial(wsURL, headers)
@@ -1310,30 +1325,49 @@ func connectAssemblyAI() error {
 		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(5*time.Second))
 	})
 
+	// Reset session-ready flag so the drain goroutine won't forward audio
+	// until AssemblyAI sends the Begin message for this new connection.
+	aaiSessionReadyMux.Lock()
+	aaiSessionReady = false
+	aaiSessionReadyMux.Unlock()
+
+	// Close the old send channel (if any) to stop the previous drain goroutine,
+	// then create a fresh one. Do this BEFORE starting handleAssemblyAIResponses
+	// so there is no window where the old channel is still live alongside the
+	// new connection.
 	aaiMutex.Lock()
+	if audioSendCh != nil {
+		close(audioSendCh) // signals the old drain goroutine to exit
+		audioSendCh = nil
+	}
+	newCh := make(chan []byte, 100)
+	audioSendCh = newCh
 	aaiWSConn = conn
 	aaiConnected = true
 	aaiMutex.Unlock()
 
 	fmt.Println("✅ Connected to AssemblyAI")
-	go handleAssemblyAIResponses()
 
-	// Always create a fresh send channel for this connection so reconnects work.
-	// The old channel was closed by disconnectAssemblyAI(), so we must not reuse it.
-	audioSendCh = make(chan []byte, 100)
-	go func(ch chan []byte) {
+	// Drain goroutine: forwards audio to *this specific connection* only.
+	// Using captured conn and newCh prevents races with future reconnects.
+	go func(ch chan []byte, c *websocket.Conn) {
 		for chunk := range ch {
-			aaiMutex.RLock()
-			c := aaiWSConn
-			aaiMutex.RUnlock()
-			if c == nil {
-				return
-			}
 			if err := c.WriteMessage(websocket.BinaryMessage, chunk); err != nil {
+				// Connection gone; exit so the reconnect can start a fresh goroutine.
 				return
 			}
 		}
-	}(audioSendCh)
+	}(newCh, conn)
+
+	go handleAssemblyAIResponses()
+
+	// Re-assert isListening in case this is a reconnect (session was active but
+	// the AssemblyAI session got terminated and we dialled a fresh one).
+	sessionMutex.Lock()
+	if sessionActive {
+		isListening = true
+	}
+	sessionMutex.Unlock()
 
 	return nil
 }
@@ -1416,6 +1450,10 @@ func handleAssemblyAIResponses() {
 			var msg AAIBeginMessage
 			json.Unmarshal(data, &msg)
 			fmt.Printf("🟢 Session started: %s\n", msg.ID)
+
+			aaiSessionReadyMux.Lock()
+			aaiSessionReady = true
+			aaiSessionReadyMux.Unlock()
 		case "Turn":
 			var msg AAITurnMessage
 			json.Unmarshal(data, &msg)
@@ -1430,6 +1468,10 @@ func handleAssemblyAIResponses() {
 				aaiWSConn = nil
 			}
 			aaiMutex.Unlock()
+
+			aaiSessionReadyMux.Lock()
+			aaiSessionReady = false
+			aaiSessionReadyMux.Unlock()
 
 			// Auto-reconnect on termination if session still active
 			sessionMutex.Lock()
@@ -1562,6 +1604,10 @@ func disconnectAssemblyAI() {
 
 	aaiMutex.Unlock()
 
+	aaiSessionReadyMux.Lock()
+	aaiSessionReady = false
+	aaiSessionReadyMux.Unlock()
+
 	if conn != nil {
 		terminate := AAITerminateMessage{Type: "Terminate"}
 		data, _ := json.Marshal(terminate)
@@ -1609,8 +1655,34 @@ func initAudioDevice() error {
 	}
 	audioFormat = (*WAVEFORMATEX)(unsafe.Pointer(pFormat))
 
-	fmt.Printf("🎧 Loopback capture: %d Hz, %d channels, %d bits\n",
-		audioFormat.NSamplesPerSec, audioFormat.NChannels, audioFormat.WBitsPerSample)
+	// Decode the format — WASAPI almost always returns WAVEFORMATEXTENSIBLE
+	// (FormatTag == 0xFFFE). Reading WBitsPerSample from the base struct gives
+	// the *container* size, not the valid bits, which causes garbled audio when
+	// the format is e.g. 24-valid-bits-in-32-bit-containers.
+	info := audioFormatInfo{
+		sampleRate:    int(audioFormat.NSamplesPerSec),
+		channels:      int(audioFormat.NChannels),
+		bitsPerSample: int(audioFormat.WBitsPerSample),
+		validBits:     int(audioFormat.WBitsPerSample),
+		isFloat:       false,
+	}
+	if audioFormat.WFormatTag == WAVE_FORMAT_IEEE_FLOAT {
+		info.isFloat = true
+	} else if audioFormat.WFormatTag == WAVE_FORMAT_EXTENSIBLE && audioFormat.CBSize >= 22 {
+		// Go pads WAVEFORMATEX to 20 bytes, so WAVEFORMATEXTENSIBLE overlay is misaligned.
+		// Read extended fields at the raw Windows memory offsets directly.
+		base := unsafe.Pointer(pFormat)
+		info.validBits = int(*(*uint16)(unsafe.Pointer(uintptr(base) + 18)))
+		// SubFormat GUID starts at offset 24; first 4 bytes identify PCM vs FLOAT
+		subTag := binary.LittleEndian.Uint32((*[4]byte)(unsafe.Pointer(uintptr(base) + 24))[:])
+		if subTag == WAVE_FORMAT_IEEE_FLOAT {
+			info.isFloat = true
+		}
+	}
+	audioInfo = info
+
+	fmt.Printf("🎧 Loopback capture: %d Hz, %d ch, %d-bit container (%d valid), float=%v\n",
+		info.sampleRate, info.channels, info.bitsPerSample, info.validBits, info.isFloat)
 
 	hr = comCall(pAudioClient, 3,
 		AUDCLNT_SHAREMODE_SHARED,
@@ -1666,48 +1738,49 @@ func audioTick() {
 
 	if hr == 0 && framesAvailable > 0 {
 		bytesAvailable := uint32(framesAvailable) * uint32(audioFormat.NBlockAlign)
+		data := unsafe.Slice((*byte)(unsafe.Pointer(pData)), bytesAvailable)
+		converted := convertAudioFormat(data)
 
 		if flags&AUDCLNT_BUFFERFLAGS_SILENT == 0 {
 			audioActivityMutex.Lock()
 			lastAudioActivity = time.Now()
 			audioActivityMutex.Unlock()
-			data := unsafe.Slice((*byte)(unsafe.Pointer(pData)), bytesAvailable)
-			converted := convertAudioFormat(data)
-			audioMutex.Lock()
-			audioBuffer = append(audioBuffer, converted...)
-			audioMutex.Unlock()
-		} else {
-			data := unsafe.Slice((*byte)(unsafe.Pointer(pData)), bytesAvailable)
-			converted := convertAudioFormat(data)
-			audioMutex.Lock()
-			audioBuffer = append(audioBuffer, converted...)
-			audioMutex.Unlock()
 		}
+
+		// Always buffer converted audio (including silent frames) so AssemblyAI
+		// receives a continuous stream for accurate pause/turn detection.
+		audioMutex.Lock()
+		audioBuffer = append(audioBuffer, converted...)
+		audioMutex.Unlock()
 		comCall(pCaptureClient, 4, uintptr(framesAvailable))
 	}
 
-	const outBytesPerMs = SAMPLE_RATE * 2 / 1000
-	const targetBytes = 100 * outBytesPerMs // 100ms chunks
+	// AssemblyAI v3 requires audio chunks between 50ms and 1000ms.
+	// We accumulate 100ms (3200 bytes at 16kHz 16-bit mono) before sending.
+	// The capture timer fires every 20ms, so we only send once we have enough
+	// buffered — this keeps transmission at real-time rate (100ms sent per 100ms).
+	const chunkBytes = SAMPLE_RATE * 2 * 100 / 1000 // 100ms = 3200 bytes
 
+	// Only send one chunk per audioTick call to avoid exceeding real-time rate.
 	audioMutex.Lock()
 	bufLen := len(audioBuffer)
+	if bufLen < chunkBytes {
+		audioMutex.Unlock()
+		return
+	}
+	chunk := make([]byte, chunkBytes)
+	copy(chunk, audioBuffer[:chunkBytes])
+	audioBuffer = audioBuffer[chunkBytes:]
 	audioMutex.Unlock()
 
-	if bufLen >= targetBytes {
-		audioMutex.Lock()
-		chunk := make([]byte, targetBytes)
-		copy(chunk, audioBuffer[:targetBytes])
-		audioBuffer = audioBuffer[targetBytes:]
-		audioMutex.Unlock()
-
-		// Non-blocking send to the channel — the sender goroutine handles the
-		// actual WebSocket write off the UI thread.
-		if audioSendCh != nil {
-			select {
-			case audioSendCh <- chunk:
-			default:
-				// channel full (backpressure), drop oldest chunk silently
-			}
+	aaiMutex.RLock()
+	ch := audioSendCh
+	aaiMutex.RUnlock()
+	if ch != nil {
+		select {
+		case ch <- chunk:
+		default:
+			// backpressure: channel full, drop this chunk
 		}
 	}
 }
@@ -1773,6 +1846,40 @@ func startSession() {
 		if hwndMain != 0 {
 			procInvalidateRect.Call(uintptr(hwndMain), 0, 1)
 		}
+
+		// Silence keepalive: AssemblyAI terminates sessions idle for ~60s.
+		// Send silence only when there has been genuinely no audio activity for
+		// at least 2 seconds — not just because the buffer drained (it drains
+		// every 20ms even during active speech).
+		const silenceChunkBytes = SAMPLE_RATE * 2 * 200 / 1000 // 200ms of silence
+		silenceChunk := make([]byte, silenceChunkBytes)        // zero = silence
+		go func() {
+			ticker := time.NewTicker(200 * time.Millisecond)
+			defer ticker.Stop()
+			for range ticker.C {
+				sessionMutex.Lock()
+				active := sessionActive
+				sessionMutex.Unlock()
+				if !active {
+					return
+				}
+				// Only inject silence when no real audio has arrived for 2s+
+				audioActivityMutex.Lock()
+				idle := time.Since(lastAudioActivity) > 2*time.Second
+				audioActivityMutex.Unlock()
+				if idle {
+					aaiMutex.RLock()
+					ch := audioSendCh
+					aaiMutex.RUnlock()
+					if ch != nil {
+						select {
+						case ch <- silenceChunk:
+						default:
+						}
+					}
+				}
+			}
+		}()
 	}()
 }
 
@@ -1922,12 +2029,8 @@ func streamAIResponse(ctx context.Context, userText string) {
 				// Keep scroll height accurate so clamping works
 				updateTotalMessageHeight()
 
-				// FIX 4: Only auto-scroll if user hasn't manually scrolled
-				scrollMutex.Lock()
-				if !userScrolled {
-					scrollOffset = 0
-				}
-				scrollMutex.Unlock()
+				// Do NOT touch scrollOffset during streaming — let the user read.
+				// Scrolling to latest only happens when a new question is sent (sendToAI).
 
 				if hwndMain != 0 {
 					procInvalidateRect.Call(uintptr(hwndMain), 0, 1)
@@ -1988,10 +2091,8 @@ func streamAIResponse(ctx context.Context, userText string) {
 	convMutex.Unlock()
 
 	updateTotalMessageHeight()
-	scrollMutex.Lock()
-	scrollOffset = 0
-	userScrolled = false
-	scrollMutex.Unlock()
+	// Do not reset scrollOffset here — preserve the user's reading position.
+	// The next user question (sendToAI) will scroll to show it.
 }
 
 func sendToAI(userText string) {
@@ -2047,80 +2148,81 @@ func callAIAPI(ctx context.Context, prompt string) string {
 // ═══════════════════════════════════════════════════════════════════════════
 
 func convertAudioFormat(data []byte) []byte {
-	if audioFormat == nil {
-		return data
-	}
-	srcRate := int(audioFormat.NSamplesPerSec)
-	channels := int(audioFormat.NChannels)
-	bitsPerSample := int(audioFormat.WBitsPerSample)
-
-	var monoFloat []float32
-
-	if bitsPerSample == 32 && channels == 2 {
-		frameCount := len(data) / 8
-		monoFloat = make([]float32, frameCount)
-		for i := 0; i < frameCount; i++ {
-			lBits := binary.LittleEndian.Uint32(data[i*8:])
-			rBits := binary.LittleEndian.Uint32(data[i*8+4:])
-			l := math.Float32frombits(lBits)
-			r := math.Float32frombits(rBits)
-			monoFloat[i] = (l + r) * 0.5
-		}
-	} else if bitsPerSample == 32 && channels == 1 {
-		frameCount := len(data) / 4
-		monoFloat = make([]float32, frameCount)
-		for i := 0; i < frameCount; i++ {
-			bits := binary.LittleEndian.Uint32(data[i*4:])
-			monoFloat[i] = math.Float32frombits(bits)
-		}
-	} else if bitsPerSample == 16 && channels == 2 {
-		frameCount := len(data) / 4
-		monoFloat = make([]float32, frameCount)
-		for i := 0; i < frameCount; i++ {
-			l := int16(binary.LittleEndian.Uint16(data[i*4:]))
-			r := int16(binary.LittleEndian.Uint16(data[i*4+2:]))
-			monoFloat[i] = float32(l+r) / 2.0 / 32768.0
-		}
-	} else if bitsPerSample == 16 && channels == 1 {
-		frameCount := len(data) / 2
-		monoFloat = make([]float32, frameCount)
-		for i := 0; i < frameCount; i++ {
-			s := int16(binary.LittleEndian.Uint16(data[i*2:]))
-			monoFloat[i] = float32(s) / 32768.0
-		}
-	} else {
-		return data
+	info := audioInfo
+	if info.sampleRate == 0 {
+		return data // not initialised yet
 	}
 
+	srcRate := info.sampleRate
+	channels := info.channels
+	bitsPerSample := info.bitsPerSample // container width
+	isFloat := info.isFloat
+
+	bytesPerFrame := channels * (bitsPerSample / 8)
+	if bytesPerFrame == 0 || len(data)%bytesPerFrame != 0 {
+		return data
+	}
+	frameCount := len(data) / bytesPerFrame
+
+	monoFloat := make([]float32, frameCount)
+
+	for i := 0; i < frameCount; i++ {
+		frameOff := i * bytesPerFrame
+		var sum float64
+		for ch := 0; ch < channels; ch++ {
+			sampleOff := frameOff + ch*(bitsPerSample/8)
+			var s float32
+			if isFloat && bitsPerSample == 32 {
+				bits := binary.LittleEndian.Uint32(data[sampleOff:])
+				s = math.Float32frombits(bits)
+			} else if isFloat && bitsPerSample == 64 {
+				bits := binary.LittleEndian.Uint64(data[sampleOff:])
+				s = float32(math.Float64frombits(bits))
+			} else if bitsPerSample == 32 {
+				// 32-bit integer PCM (rare but exists)
+				v := int32(binary.LittleEndian.Uint32(data[sampleOff:]))
+				s = float32(v) / 2147483648.0
+			} else if bitsPerSample == 24 {
+				// 24-bit packed integer
+				v := int32(uint32(data[sampleOff]) | uint32(data[sampleOff+1])<<8 | uint32(data[sampleOff+2])<<16)
+				if v&0x800000 != 0 {
+					v |= ^0xFFFFFF // sign-extend
+				}
+				s = float32(v) / 8388608.0
+			} else if bitsPerSample == 16 {
+				v := int16(binary.LittleEndian.Uint16(data[sampleOff:]))
+				s = float32(v) / 32768.0
+			}
+			sum += float64(s)
+		}
+		monoFloat[i] = float32(sum / float64(channels))
+	}
+
+	// Resample to target rate using linear interpolation (better than box filter
+	// for downsampling ratios that aren't integer multiples, e.g. 48000→16000).
 	outRate := SAMPLE_RATE
-	var decimated []float32
+	var resampled []float32
 	if srcRate == outRate {
-		decimated = monoFloat
+		resampled = monoFloat
 	} else {
-		step := float64(srcRate) / float64(outRate)
-		outLen := int(float64(len(monoFloat)) / step)
-		decimated = make([]float32, 0, outLen)
+		ratio := float64(srcRate) / float64(outRate)
+		outLen := int(float64(frameCount) / ratio)
+		resampled = make([]float32, outLen)
 		for i := 0; i < outLen; i++ {
-			startF := float64(i) * step
-			endF := startF + step
-			start := int(startF)
-			end := int(endF)
-			if end > len(monoFloat) {
-				end = len(monoFloat)
+			srcPos := float64(i) * ratio
+			lo := int(srcPos)
+			hi := lo + 1
+			frac := float32(srcPos - float64(lo))
+			if hi >= frameCount {
+				hi = frameCount - 1
 			}
-			if start >= len(monoFloat) {
-				break
-			}
-			var sum float32
-			for j := start; j < end; j++ {
-				sum += monoFloat[j]
-			}
-			decimated = append(decimated, sum/float32(end-start))
+			resampled[i] = monoFloat[lo]*(1-frac) + monoFloat[hi]*frac
 		}
 	}
 
-	out := make([]byte, len(decimated)*2)
-	for i, f := range decimated {
+	// Convert to 16-bit signed PCM little-endian (what AssemblyAI expects)
+	out := make([]byte, len(resampled)*2)
+	for i, f := range resampled {
 		if f > 1.0 {
 			f = 1.0
 		} else if f < -1.0 {
