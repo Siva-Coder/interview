@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"os"
+	"runtime"
 	"strconv"
 
 	"context"
@@ -1317,25 +1318,22 @@ func connectAssemblyAI() error {
 	fmt.Println("✅ Connected to AssemblyAI")
 	go handleAssemblyAIResponses()
 
-	// (Re-)create the audio send channel and start its draining goroutine.
-	// The old channel (if any) is replaced; the goroutine for the previous
-	// connection will exit when it detects the connection is gone.
-	if audioSendCh == nil {
-		audioSendCh = make(chan []byte, 100)
-		go func(ch chan []byte) {
-			for chunk := range ch {
-				aaiMutex.RLock()
-				c := aaiWSConn
-				aaiMutex.RUnlock()
-				if c == nil {
-					return
-				}
-				if err := c.WriteMessage(websocket.BinaryMessage, chunk); err != nil {
-					return
-				}
+	// Always create a fresh send channel for this connection so reconnects work.
+	// The old channel was closed by disconnectAssemblyAI(), so we must not reuse it.
+	audioSendCh = make(chan []byte, 100)
+	go func(ch chan []byte) {
+		for chunk := range ch {
+			aaiMutex.RLock()
+			c := aaiWSConn
+			aaiMutex.RUnlock()
+			if c == nil {
+				return
 			}
-		}(audioSendCh)
-	}
+			if err := c.WriteMessage(websocket.BinaryMessage, chunk); err != nil {
+				return
+			}
+		}
+	}(audioSendCh)
 
 	return nil
 }
@@ -1737,37 +1735,45 @@ func startSession() {
 	sessionActive = true
 	sessionMutex.Unlock()
 
-	// Initialise audio if not already
-	if !audioStarted {
-		if err := connectAssemblyAI(); err != nil {
-			fmt.Printf("⚠️  AssemblyAI connection failed: %v\n", err)
+	// Run blocking network + COM init off the UI thread so the message loop
+	// never stalls. Once everything is ready we start the audio capture timer
+	// via PostMessage-equivalent (SetTimer is safe to call cross-thread on Win32).
+	go func() {
+		if !audioStarted {
+			if err := connectAssemblyAI(); err != nil {
+				fmt.Printf("⚠️  AssemblyAI connection failed: %v\n", err)
+			}
+			if err := initAudioDevice(); err != nil {
+				fmt.Printf("⚠️  Audio init failed: %v\n", err)
+				sessionMutex.Lock()
+				sessionActive = false
+				sessionMutex.Unlock()
+				if hwndMain != 0 {
+					procInvalidateRect.Call(uintptr(hwndMain), 0, 1)
+				}
+				return
+			}
+		} else {
+			// Audio already set up, just restart client if stopped
+			comCall(pAudioClient, 10) // Start
 		}
-		if err := initAudioDevice(); err != nil {
-			fmt.Printf("⚠️  Audio init failed: %v\n", err)
-			sessionMutex.Lock()
-			sessionActive = false
-			sessionMutex.Unlock()
-			return
+
+		// SetTimer with a window handle is safe to call from any thread.
+		if hwndMain != 0 {
+			procSetTimer.Call(uintptr(hwndMain), TIMER_AUDIO_CAP, 20, 0)
 		}
-		// Set audio capture timer (20ms)
-		procSetTimer.Call(uintptr(hwndMain), TIMER_AUDIO_CAP, 20, 0)
-	} else {
-		// Audio already set up, just restart client if stopped
-		comCall(pAudioClient, 10) // Start
-		procSetTimer.Call(uintptr(hwndMain), TIMER_AUDIO_CAP, 20, 0)
-	}
 
-	isListening = true
+		isListening = true
 
-	// Initialize audio activity tracker
-	audioActivityMutex.Lock()
-	lastAudioActivity = time.Now()
-	audioActivityMutex.Unlock()
+		audioActivityMutex.Lock()
+		lastAudioActivity = time.Now()
+		audioActivityMutex.Unlock()
 
-	fmt.Println("▶ Session started")
-	if hwndMain != 0 {
-		procInvalidateRect.Call(uintptr(hwndMain), 0, 1)
-	}
+		fmt.Println("▶ Session started")
+		if hwndMain != 0 {
+			procInvalidateRect.Call(uintptr(hwndMain), 0, 1)
+		}
+	}()
 }
 
 func stopSession() {
@@ -2165,7 +2171,9 @@ func wndProc(hwnd windows.Handle, msg uint32, wParam uintptr, lParam uintptr) ui
 	case WM_TIMER:
 		switch wParam {
 		case TIMER_REFRESH:
-			enforceTopmostOnly(uintptr(hwnd))
+			// enforceTopmostOnly removed from here — calling SetWindowPos 7×/sec
+			// caused jank and reentrant WM_WINDOWPOSCHANGED storms on the UI thread.
+			// Topmost is enforced once at startup and on WM_ACTIVATEAPP instead.
 			var pt POINT
 			procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
 			var wr RECT
@@ -2607,6 +2615,13 @@ func splitWords(s string) []string {
 // ═══════════════════════════════════════════════════════════════════════════
 
 func main() {
+	// Pin the main goroutine to its OS thread for the lifetime of the process.
+	// COM (CoInitializeEx), Direct2D, WASAPI, and the Win32 message loop all
+	// require every call to happen on the exact same OS thread. Without this,
+	// Go's scheduler is free to migrate the goroutine between threads, which
+	// causes silent COM failures, hangs in GetMessage, and random crashes.
+	runtime.LockOSThread()
+
 	assemblyAIKey = os.Getenv("ASSEMBLYAI_API_KEY")
 	geminiKey = os.Getenv("GEMINI_API_KEY")
 	fmt.Println(assemblyAIKey, geminiKey)
