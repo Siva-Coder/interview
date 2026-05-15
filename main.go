@@ -746,24 +746,31 @@ func updateTotalMessageHeight() {
 	lineH := float32(22)
 	gap := float32(12)
 	headingH := float32(26)
+	codeLineH := float32(16)
 
 	for _, msg := range conversation {
+		// msgH must match renderFrame exactly: labelH + span heights + gap
+		msgH := labelH
 		if len(msg.Spans) > 0 {
-			for _, span := range msg.Spans {
+			spans := msg.WrappedSpans
+			if len(spans) == 0 {
+				spans = msg.Spans
+			}
+			for _, span := range spans {
 				if span.Heading > 0 {
-					totalMsgHeight += headingH
+					msgH += headingH
 				} else if span.Code {
-					// Code block: estimate 16px per line
 					codeLines := float32(strings.Count(span.Text, "\n") + 1)
-					totalMsgHeight += codeLines*16 + 8 // padding
+					msgH += codeLines*codeLineH + 8
 				} else {
-					totalMsgHeight += lineH
+					msgH += lineH
 				}
 			}
-			totalMsgHeight += gap
 		} else {
-			totalMsgHeight += labelH + float32(len(msg.Lines))*lineH + gap
+			msgH += float32(len(msg.Lines)) * lineH
 		}
+		msgH += gap
+		totalMsgHeight += msgH
 	}
 
 	// Include streaming AI message height so clamping works during generation
@@ -773,7 +780,6 @@ func updateTotalMessageHeight() {
 	partialAIResponseMutex.Unlock()
 
 	if streaming {
-		// Estimate height without parsing markdown
 		lineCount := len(wrapText(aiPartial, 52))
 		totalMsgHeight += labelH + float32(lineCount)*lineH + gap
 	}
@@ -1847,14 +1853,13 @@ func startSession() {
 			procInvalidateRect.Call(uintptr(hwndMain), 0, 1)
 		}
 
-		// Silence keepalive: AssemblyAI terminates sessions idle for ~60s.
-		// Send silence only when there has been genuinely no audio activity for
-		// at least 2 seconds — not just because the buffer drained (it drains
-		// every 20ms even during active speech).
-		const silenceChunkBytes = SAMPLE_RATE * 2 * 200 / 1000 // 200ms of silence
+		// Continuous silence keepalive: always send 100ms of silence every 100ms
+		// when no real audio is in the buffer. This guarantees AssemblyAI never
+		// sees a dead connection, which was causing it to drop the session.
+		const silenceChunkBytes = SAMPLE_RATE * 2 * 100 / 1000 // 100ms = 3200 bytes
 		silenceChunk := make([]byte, silenceChunkBytes)        // zero = silence
 		go func() {
-			ticker := time.NewTicker(200 * time.Millisecond)
+			ticker := time.NewTicker(100 * time.Millisecond)
 			defer ticker.Stop()
 			for range ticker.C {
 				sessionMutex.Lock()
@@ -1863,11 +1868,12 @@ func startSession() {
 				if !active {
 					return
 				}
-				// Only inject silence when no real audio has arrived for 2s+
-				audioActivityMutex.Lock()
-				idle := time.Since(lastAudioActivity) > 2*time.Second
-				audioActivityMutex.Unlock()
-				if idle {
+				// Only inject silence when the real audio buffer is empty —
+				// real audio always takes priority.
+				audioMutex.Lock()
+				bufEmpty := len(audioBuffer) < silenceChunkBytes
+				audioMutex.Unlock()
+				if bufEmpty {
 					aaiMutex.RLock()
 					ch := audioSendCh
 					aaiMutex.RUnlock()
