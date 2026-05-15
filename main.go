@@ -532,8 +532,8 @@ func rgba(r, g, b uint8, a float32) D2D1_COLOR_F {
 func rectF(l, t, r, b float32) D2D1_RECT_F { return D2D1_RECT_F{l, t, r, b} }
 
 var (
-	clrBg         = rgba(0x0D, 0x0D, 0x18, 1.0)
-	clrHeaderBg   = rgba(0x0D, 0x0D, 0x18, 1.0) // opaque header
+	clrBg         = rgba(0x0D, 0x0D, 0x18, 0.88) // semi-transparent for glass
+	clrHeaderBg   = rgba(0x0D, 0x0D, 0x18, 0.96) // slightly more opaque header
 	clrGreen      = rgba(0x34, 0xd3, 0x99, 1)
 	clrGreenDim   = rgba(0x10, 0x99, 0x66, 1)
 	clrGreenMuted = rgba(0x0a, 0x5c, 0x40, 1)
@@ -544,7 +544,7 @@ var (
 	clrRedBright  = rgba(0xff, 0x4d, 0x4d, 1)
 	clrUserBubble = rgba(0x1a, 0x3d, 0x6a, 0.9)
 	clrAiLine     = rgba(0x34, 0xd3, 0x99, 0.25) // subtle left accent line for AI
-	clrBorder     = rgba(0xff, 0xff, 0xff, 0.08)
+	clrBorder     = rgba(0xff, 0xff, 0xff, 0.22) // more visible for glass edge
 )
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -656,14 +656,22 @@ var (
 
 	lastAudioActivity  time.Time
 	audioActivityMutex sync.Mutex
-	silenceThresholdMs int64 = 1500 // must be silent for 1.5s before sending
-
-	aaiReconnecting bool
-	aaiReconnectMux sync.Mutex
+	aaiReconnecting    bool
+	aaiReconnectMux    sync.Mutex
 
 	// Buffered channel for audio chunks — written on UI thread, drained in goroutine
 	audioSendCh chan []byte
 )
+
+// safelySend sends to ch without panicking if ch was closed between the caller
+// capturing the pointer and the actual send (possible during reconnect).
+func safelySend(ch chan []byte, chunk []byte) {
+	defer func() { recover() }()
+	select {
+	case ch <- chunk:
+	default: // drop on backpressure
+	}
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  COM helpers
@@ -691,6 +699,15 @@ func createBrush(rt uintptr, c D2D1_COLOR_F) uintptr {
 	var brush uintptr
 	comCall(rt, 8, uintptr(unsafe.Pointer(&c)), 0, uintptr(unsafe.Pointer(&brush)))
 	return brush
+}
+
+// setBrushColor updates an existing ID2D1SolidColorBrush colour (vtable slot 8).
+// Used to change background opacity at runtime without recreating brushes.
+func setBrushColor(brush uintptr, c D2D1_COLOR_F) {
+	if brush == 0 {
+		return
+	}
+	comCall(brush, 8, uintptr(unsafe.Pointer(&c)))
 }
 
 func d2dFillRect(rt, brush uintptr, rc D2D1_RECT_F) {
@@ -811,11 +828,25 @@ func inSliderArea(x, y int32) bool {
 func updateAlphaFromMouse(mx int32) {
 	thumbRange := float32(SLIDER_W - SLIDER_THUMB_W)
 	newAlpha := uint8((float32(mx-SLIDER_X) / thumbRange) * 255)
-	if newAlpha < 50 {
-		newAlpha = 50 // minimum opacity
+	if newAlpha < 30 {
+		newAlpha = 30 // minimum: nearly-transparent glass
 	}
 	alphaValue = newAlpha
-	procSetLayeredWindowAttributes.Call(uintptr(hwndMain), 0, uintptr(alphaValue), LWA_ALPHA)
+
+	// Slider now controls the *background overlay* opacity only.
+	// Text, borders, and all controls remain fully opaque (their brushes are unaffected).
+	// This gives a "real glass" look: background tint fades out, text stays 100% readable.
+	bgA := float32(alphaValue) / 255.0
+	setBrushColor(brushBg, rgba(0x0D, 0x0D, 0x18, bgA*0.95))
+	// Header is always at least 10% more opaque than body so it masks scrolling chat text
+	headerA := bgA*0.95 + 0.10
+	if headerA > 1.0 {
+		headerA = 1.0
+	}
+	setBrushColor(brushHeaderBg, rgba(0x0D, 0x0D, 0x18, headerA))
+	if hwndMain != 0 {
+		procInvalidateRect.Call(uintptr(hwndMain), 0, 1)
+	}
 }
 
 func renderSpans(rt uintptr, spans []RichTextSpan, x, y, maxW, viewBottom float32, isVirtual, isUser bool) {
@@ -1005,18 +1036,22 @@ func renderFrame() {
 
 	comCall(pRenderTarget, 48) // BeginDraw
 
-	// FIX 1: Clear with FULLY OPAQUE background first, then apply window alpha via layered attrib
-	// The layered window alpha applies to the ENTIRE window, so we must draw opaque header on top
-	opaqueBg := rgba(0x0D, 0x0D, 0x18, 1.0)
-	comCall(pRenderTarget, 47, uintptr(unsafe.Pointer(&opaqueBg))) // Clear opaque
+	// ── Glass effect: clear to transparent, let DWM blur show through ───────
+	// Background opacity is controlled by the slider (alphaValue), NOT LWA_ALPHA.
+	// Text and controls are drawn at full alpha so they are always fully readable.
+	transparent := rgba(0, 0, 0, 0)
+	comCall(pRenderTarget, 47, uintptr(unsafe.Pointer(&transparent))) // Clear transparent
+
+	// Semi-transparent rounded window background (inset 1px so rounded corners clip cleanly)
+	d2dFillRoundedRect(pRenderTarget, brushBg, rectF(1, 1, W-1, float32(WIN_H)-1), 19, 19)
 
 	sessionMutex.Lock()
 	active := sessionActive
 	sessionMutex.Unlock()
 
-	// ── Glass border ────────────────────────────────────────────────────
+	// ── Glass border (drawn on top of bg fill) ──────────────────────────────
 	borderRR := D2D1_ROUNDED_RECT{Rect: rectF(0.5, 0.5, W-0.5, float32(WIN_H)-0.5), RadiusX: 20, RadiusY: 20}
-	comCall(pRenderTarget, 18, uintptr(unsafe.Pointer(&borderRR)), brushBorder, uintptr(mathFloat32bits(1.0)), 0)
+	comCall(pRenderTarget, 18, uintptr(unsafe.Pointer(&borderRR)), brushBorder, uintptr(mathFloat32bits(1.5)), 0)
 
 	// ── Chat content (drawn FIRST, will be covered by opaque header) ────
 	// This ensures any chat text scrolling up gets hidden behind the header
@@ -1102,11 +1137,9 @@ func renderFrame() {
 		localTotalH += msgH
 	}
 
-	firstY := viewBottom - localTotalH + offset
-	// If content is shorter than view, pin to top
-	if localTotalH < availableH {
-		firstY = viewTop
-	}
+	// Top-pinned: content starts at viewTop, scrollOffset moves it up.
+	// Never auto-scrolls — position is 100% user-controlled.
+	firstY := viewTop - offset
 
 	yPos := firstY
 	for i := 0; i < len(items); i++ {
@@ -1302,8 +1335,8 @@ func connectAssemblyAI() error {
 	params.Add("sample_rate", fmt.Sprintf("%d", SAMPLE_RATE))
 	params.Add("format_turns", "true")
 	params.Add("speech_model", "u3-rt-pro")
-	params.Add("min_turn_silence", "100")
-	params.Add("max_turn_silence", "1000")
+	params.Add("min_turn_silence", "800")  // 800ms silence = end of sentence
+	params.Add("max_turn_silence", "3000") // allow 3s pauses within a turn
 
 	wsURL := fmt.Sprintf("%s?%s", ASSEMBLYAI_WS_URL, params.Encode())
 	headers := http.Header{}
@@ -1434,11 +1467,27 @@ func handleAssemblyAIResponses() {
 			sessionMutex.Unlock()
 
 			if shouldReconnect {
-				fmt.Println("🔄 Attempting to reconnect to AssemblyAI...")
-				time.Sleep(2 * time.Second) // Brief backoff
-				if err := connectAssemblyAI(); err != nil {
-					fmt.Printf("❌ Reconnection failed: %v\n", err)
-				}
+				go func() {
+					for attempt := 1; attempt <= 10; attempt++ {
+						sessionMutex.Lock()
+						stillActive := sessionActive
+						sessionMutex.Unlock()
+						if !stillActive {
+							return
+						}
+						fmt.Printf("🔄 Reconnecting to AssemblyAI (attempt %d)...\n", attempt)
+						if err := connectAssemblyAI(); err == nil {
+							fmt.Println("✅ Reconnected, listening again")
+							return
+						}
+						sleep := time.Duration(attempt) * time.Second
+						if sleep > 8*time.Second {
+							sleep = 8 * time.Second
+						}
+						time.Sleep(sleep)
+					}
+					fmt.Println("❌ Failed to reconnect to AssemblyAI after 10 attempts")
+				}()
 			}
 			break
 		}
@@ -1485,9 +1534,27 @@ func handleAssemblyAIResponses() {
 			sessionMutex.Unlock()
 
 			if shouldReconnect {
-				fmt.Println("🔄 Session terminated, reconnecting...")
-				time.Sleep(1 * time.Second)
-				connectAssemblyAI()
+				go func() {
+					for attempt := 1; attempt <= 10; attempt++ {
+						sessionMutex.Lock()
+						stillActive := sessionActive
+						sessionMutex.Unlock()
+						if !stillActive {
+							return
+						}
+						fmt.Printf("🔄 Reconnecting to AssemblyAI (attempt %d)...\n", attempt)
+						if err := connectAssemblyAI(); err == nil {
+							fmt.Println("✅ Reconnected, listening again")
+							return
+						}
+						sleep := time.Duration(attempt) * time.Second
+						if sleep > 8*time.Second {
+							sleep = 8 * time.Second
+						}
+						time.Sleep(sleep)
+					}
+					fmt.Println("❌ Failed to reconnect to AssemblyAI after 10 attempts")
+				}()
 			}
 			return
 		}
@@ -1506,44 +1573,40 @@ func handleTurnMessage(msg AAITurnMessage) {
 		return
 	}
 
-	// Update last speech time for debounce logic
-	lastSpeechMutex.Lock()
-	lastSpeechTime = time.Now()
-	lastSpeechMutex.Unlock()
-
 	if msg.EndOfTurn {
-		// ── final transcript received ─────────────────────────
-		// store the final transcript
+		// ── Final transcript received ─────────────────────────────────────
 		transcriptMutex.Lock()
 		currentTranscript = msg.Transcript
 		transcriptMutex.Unlock()
 
-		// clear partial
 		partialMutex.Lock()
 		partialTranscript = ""
 		partialMutex.Unlock()
 
-		// Interrupt any ongoing AI processing
+		// Track when this end-of-turn arrived (used only for logging/debug now)
+		lastSpeechMutex.Lock()
+		lastSpeechTime = time.Now()
+		lastSpeechMutex.Unlock()
+
+		// Interrupt any in-progress AI stream — user has completed a new utterance
 		aiCancelMux.Lock()
 		if cancelAI != nil {
 			cancelAI()
 			cancelAI = nil
 		}
 		aiCancelMux.Unlock()
-
 		isProcessing = false
 		isAIResponding = false
 
-		// Clear any streaming partial
 		partialAIResponseMutex.Lock()
 		partialAIResponse = ""
 		partialAIResponseMutex.Unlock()
 
-		// ── debounced send (800ms after final) ─────────────────
-		// FIX 5: Increased from 300ms to 800ms to let user finish their thought
+		// ── Debounced send: 200ms after end-of-turn ───────────────────────
+		// pendingSendCancel guards against a newer end-of-turn arriving in
+		// the window; it is the only cancellation mechanism needed here.
 		finalTranscript := msg.Transcript
 
-		// Cancel any previously scheduled send
 		pendingSendCancelMux.Lock()
 		if pendingSendCancel != nil {
 			pendingSendCancel()
@@ -1554,29 +1617,31 @@ func handleTurnMessage(msg AAITurnMessage) {
 
 		go func(transcript string, ctx context.Context) {
 			select {
-			case <-time.After(400 * time.Millisecond):
+			case <-time.After(1000 * time.Millisecond):
 				if transcript != "" {
-					// Double-check we haven't received new speech
-					lastSpeechMutex.Lock()
-					sinceLastSpeech := time.Since(lastSpeechTime)
-					lastSpeechMutex.Unlock()
-
-					// Only send if no new speech arrived during debounce window
-					if sinceLastSpeech >= 400*time.Millisecond {
-						sendToAI(transcript)
-					}
+					sendToAI(transcript)
 				}
 			case <-ctx.Done():
-				// cancelled because new turn arrived
+				// cancelled: a newer end-of-turn arrived, let it handle sending
 			}
 		}(finalTranscript, ctx)
 
 	} else {
-		// ── PARTIAL transcript (speaking) ─────────────────────
-		// Just update the UI, don't trigger any AI logic
+		// ── Partial transcript (user is actively speaking) ────────────────
+		// Only update the display — do NOT cancel pending sends or AI streams.
+		// Cancelling here caused premature mid-sentence sends whenever the user
+		// took a breath, because each breath reset the whole pipeline.
 		partialMutex.Lock()
 		partialTranscript = msg.Transcript
 		partialMutex.Unlock()
+
+		// Cancel any pending debounced send — user is still speaking
+		pendingSendCancelMux.Lock()
+		if pendingSendCancel != nil {
+			pendingSendCancel()
+			pendingSendCancel = nil
+		}
+		pendingSendCancelMux.Unlock()
 	}
 
 	if hwndMain != 0 {
@@ -1783,11 +1848,7 @@ func audioTick() {
 	ch := audioSendCh
 	aaiMutex.RUnlock()
 	if ch != nil {
-		select {
-		case ch <- chunk:
-		default:
-			// backpressure: channel full, drop this chunk
-		}
+		safelySend(ch, chunk)
 	}
 }
 
@@ -1878,10 +1939,7 @@ func startSession() {
 					ch := audioSendCh
 					aaiMutex.RUnlock()
 					if ch != nil {
-						select {
-						case ch <- silenceChunk:
-						default:
-						}
+						safelySend(ch, silenceChunk)
 					}
 				}
 			}
@@ -1942,6 +2000,28 @@ func streamAIResponse(ctx context.Context, userText string) {
 	// Build conversation array from global history
 	convMutex.RLock()
 	msgs := make([]openaiChatMessage, 0, len(conversation))
+
+	msgs = append(msgs, openaiChatMessage{
+		Role: "system",
+		Content: `You are a real-time interview assistant helping a candidate answer interview questions naturally and confidently.
+
+When the candidate hears a question, your job is to give them a clear, concise answer they can speak out loud immediately — not read from a screen.
+
+Rules:
+- Use simple, everyday words. No jargon, no buzzwords unless the question specifically requires them.
+- Keep answers short: 3 to 5 sentences max for most questions. If it needs more, break it into clear points.
+- Write the way a person talks, not the way a textbook reads. Contractions are fine. Short sentences are better.
+- Always lead with the direct answer first, then briefly explain or give one example.
+- Never use filler phrases like "That's a great question", "Certainly!", "Absolutely!", or "As an AI...".
+- Never use bullet points or markdown formatting — the candidate needs to speak this, not read a list.
+- If the question is behavioral (tell me about a time when...), give a short story structure: situation, what they did, what happened. Keep it under 60 seconds of speaking time.
+- If the question is technical, explain it simply as if to someone smart but not in that field.
+- If the question is vague or unclear, pick the most likely intent and answer that.
+- Stay grounded and humble in tone — confident but not arrogant.
+
+The candidate will speak the answer out loud, so every word you write should sound natural when read aloud.`,
+	})
+
 	for _, m := range conversation {
 		role := "user"
 		if m.Role == "assistant" {
@@ -2032,12 +2112,6 @@ func streamAIResponse(ctx context.Context, userText string) {
 				partialAIResponse = fullResponse.String()
 				partialAIResponseMutex.Unlock()
 
-				// Keep scroll height accurate so clamping works
-				updateTotalMessageHeight()
-
-				// Do NOT touch scrollOffset during streaming — let the user read.
-				// Scrolling to latest only happens when a new question is sent (sendToAI).
-
 				if hwndMain != 0 {
 					procInvalidateRect.Call(uintptr(hwndMain), 0, 1)
 				}
@@ -2119,10 +2193,6 @@ func sendToAI(userText string) {
 	convMutex.Unlock()
 
 	updateTotalMessageHeight()
-	scrollMutex.Lock()
-	scrollOffset = 0
-	userScrolled = false
-	scrollMutex.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	aiCancelMux.Lock()
@@ -2138,15 +2208,6 @@ func sendToAI(userText string) {
 	partialAIResponseMutex.Unlock()
 
 	go streamAIResponse(ctx, userText)
-}
-
-func callAIAPI(ctx context.Context, prompt string) string {
-	select {
-	case <-ctx.Done():
-		return ""
-	case <-time.After(2 * time.Second):
-	}
-	return "Use the STAR method:\n1. Situation: Sprint planning conflict\n2. Task: Align PM & eng timelines\n3. Action: Facilitated async RFC doc\n4. Result: Shipped on time, 0 escalations"
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2784,7 +2845,12 @@ func main() {
 		return
 	}
 
-	procSetLayeredWindowAttributes.Call(hwnd, 0, 215, LWA_ALPHA)
+	procSetLayeredWindowAttributes.Call(hwnd, 0, 255, LWA_ALPHA) // window is fully opaque; bg rect controls glass tint
+
+	// Enable DWM blur-behind so transparent D2D pixels show a blurred desktop
+	// (gives the real frosted-glass appearance controlled by the slider)
+	blur := DWM_BLURBEHIND{DwFlags: 3, FEnable: 1}
+	procDwmEnableBlurBehindWindow.Call(hwnd, uintptr(unsafe.Pointer(&blur)))
 
 	procShowWindow.Call(hwnd, SW_SHOW)
 	procUpdateWindow.Call(hwnd)
